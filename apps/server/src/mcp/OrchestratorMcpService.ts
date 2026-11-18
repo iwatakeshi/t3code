@@ -138,6 +138,7 @@ import { assertTargetWithinLimits, isLiveCallerShell, threadNotFound } from "./t
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as PeerForwarding from "../peer/PeerForwarding.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
+import * as DelegationPlacement from "../peer/DelegationPlacement.ts";
 
 // Return recoverable handles before common MCP client timeouts expire.
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
@@ -1277,6 +1278,7 @@ const make = Effect.gen(function* () {
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const remoteDelegation = yield* RemoteDelegation.RemoteDelegation;
+  const delegationPlacement = yield* DelegationPlacement.DelegationPlacement;
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -2594,6 +2596,7 @@ const make = Effect.gen(function* () {
 
     capabilities: Effect.fn("OrchestratorMcpService.capabilities")(function* (scope, input = {}) {
       const { parent, limits } = yield* loadCaller(scope, []);
+      if (input.projectId !== undefined) yield* requireProject(input.projectId);
       const providers = yield* loadProviders;
       const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
       const settings = yield* serverSettings.getSettings.pipe(
@@ -2617,13 +2620,10 @@ const make = Effect.gen(function* () {
         interactionMode: limits.interactionMode,
         providers: providers.map((provider) => {
           // Snapshots list instances any project enables; delegate_task checks the caller's project.
+          const projectId = input.projectId ?? parent?.thread.projectId;
           const enabledForCaller =
-            parent === undefined ||
-            resolveProjectProviderInstanceEnabled(
-              settings,
-              parent.thread.projectId,
-              provider.instanceId,
-            );
+            projectId === undefined ||
+            resolveProjectProviderInstanceEnabled(settings, projectId, provider.instanceId);
           const constraints = providerConstraints(
             enabledForCaller ? provider : { ...provider, enabled: false },
             orchestrationCapableInstanceIds.has(provider.instanceId),
@@ -2677,6 +2677,53 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
+      if (input.placement === "auto") {
+        const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
+        const providers = yield* loadProviders;
+        const resolved = yield* resolveTargetRechecking({
+          parent,
+          target: input.target,
+          providers,
+        }).pipe(
+          Effect.flatMap((target) =>
+            threadManagement
+              .isProviderInstanceEnabledForProject({
+                projectId: parent.thread.projectId,
+                instanceId: target.modelSelection.instanceId,
+              })
+              .pipe(
+                Effect.flatMap((enabled) =>
+                  enabled
+                    ? resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode, target).pipe(
+                        Effect.as(target),
+                      )
+                    : Effect.undefined,
+                ),
+              ),
+          ),
+          Effect.orElseSucceed(() => undefined),
+        );
+        const clientRequestId = yield* requestKey(input.clientRequestId);
+        const target = yield* delegationPlacement.select(
+          scope,
+          { ...input, clientRequestId },
+          {
+            projectId: parent.thread.projectId,
+            modelSelection: parent.thread.modelSelection,
+            driverKind: providers.find(
+              (provider) => provider.instanceId === parent.thread.modelSelection.instanceId,
+            )?.driver,
+          },
+          resolved === undefined
+            ? undefined
+            : {
+                ...input.target,
+                providerInstanceId: resolved.modelSelection.instanceId,
+                model: resolved.modelSelection.model,
+              },
+        );
+        input = { ...input, placement: undefined, clientRequestId, target };
+      }
       const environmentId =
         input.target === undefined
           ? undefined
@@ -3690,4 +3737,5 @@ export const layer: Layer.Layer<
   | SecretRequests.SecretRequests
   | ServerSettings.ServerSettingsService
   | RemoteDelegation.RemoteDelegation
+  | DelegationPlacement.DelegationPlacement
 > = Layer.effect(OrchestratorMcpService, make);

@@ -402,6 +402,19 @@ ends, as for any delegated task. It keeps following the task across restarts.
 If the other machine revokes the link, or the link is removed here, the task
 fails with that reason.
 
+To spread delegated work across your linked machines, ask the agent to use
+`placement: "auto"` on `delegate_task`. It chooses this machine or a linked
+machine using available CPU and memory, with equal preference for each. The
+other machine needs this version of T3 Code, one registered project with the
+same repository, and the requested provider and model ready to run. These
+choices are independent of the app's load-balancing preferences.
+
+Auto placement uses shared checkouts. Prepare the code on each machine before
+delegating: it does not copy files, fetch commits, or merge results. It cannot
+be combined with worktree isolation or an explicit destination. If no machine
+qualifies, the call fails without starting or queuing work. Repeating the same
+`clientRequestId` keeps the original destination.
+
 ## Manage or revoke access
 
 On the host, **Settings → Sharing & access** lets authorized administrators create

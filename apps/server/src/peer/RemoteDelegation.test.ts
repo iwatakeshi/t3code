@@ -68,6 +68,8 @@ import * as PeerForwarding from "./PeerForwarding.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 import { descriptorOf, layerLinkingEnvironment, linkTo, servePeer } from "./PeerLinks.testkit.ts";
 import * as RemoteDelegation from "./RemoteDelegation.ts";
+import * as DelegationPlacement from "./DelegationPlacement.ts";
+import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as PeerLinkRequests from "./PeerLinkRequests.ts";
 
 // The laptop's agent delegates a task to the box through a link. The box is
@@ -544,15 +546,34 @@ const boxToolkitLayer = (thread: BoxThread) => {
         ),
       ),
   });
-  return Layer.merge(
+  return Layer.mergeAll(
     McpHttpServer.layerOrchestratorToolkit,
     McpHttpServer.layerProjectRegistration,
+    McpHttpServer.layerEnvironmentToolkit,
   ).pipe(
     Layer.provide(DocumentText.layer.pipe(Layer.provideMerge(NodeServices.layer))),
-    Layer.provide(NodeCrypto.layer),
+    Layer.provide(
+      Layer.merge(
+        NodeCrypto.layer,
+        Layer.mock(HostResources.HostResources)({
+          read: Effect.succeed({
+            sampledAt: 0,
+            cpuUtilization: 0.1,
+            cpuCount: 8,
+            totalMemoryBytes: 16_000,
+            availableMemoryBytes: 12_000,
+          }),
+        }),
+      ),
+    ),
     Layer.provide(layerBoxThreads),
     Layer.provide(layerBoxLaunches),
-    Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+    Layer.provide(
+      Layer.merge(
+        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+        Layer.mock(DelegationPlacement.DelegationPlacement)({}),
+      ),
+    ),
     Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
     Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
     Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
@@ -591,7 +612,11 @@ const boxToolkitLayer = (thread: BoxThread) => {
     ),
     Layer.provide(Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({})),
     Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
-    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(
+      ServerSettings.layerTest({
+        providerInstances: { [boxClaude.instanceId]: { driver: boxClaude.driver, enabled: true } },
+      }),
+    ),
     Layer.provide(NodeServices.layer),
   );
 };
@@ -713,12 +738,36 @@ const makeLaptop = (
           ),
         ),
       ),
-      Layer.provide(Layer.succeedContext(linking)),
       Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+      Layer.provide(
+        DelegationPlacement.layer.pipe(
+          Layer.provide(PeerForwarding.layer),
+          Layer.provide(Layer.succeedContext(database)),
+          Layer.provide(Layer.mock(HostResources.HostResources)({})),
+          Layer.provide(
+            Layer.mock(ProjectService.ProjectService)({
+              getById: () => Effect.succeedSome({ workspaceRoot: "/home/me/app" } as never),
+            }),
+          ),
+          Layer.provide(
+            Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+              resolve: () =>
+                Effect.succeed({ canonicalKey: "github.com/acme/app" } as RepositoryIdentity),
+            }),
+          ),
+        ),
+      ),
+      Layer.provide(Layer.succeedContext(linking)),
       Layer.provide(NodeCrypto.layer),
       Layer.provideMerge(layerThreads),
-      Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
-      Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
+      Layer.provide(
+        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+      ),
+      Layer.provide(
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+          list: () => Effect.succeed([]),
+        }),
+      ),
       Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
       Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
       Layer.provide(Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({})),
@@ -917,6 +966,47 @@ const taskResult = (laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>, ta
           : undefined,
       ),
     );
+
+it.effect("Auto placement delegates through the peer transport and returns the result", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const a = yield* makeLaptop(database, offers);
+      yield* linkTo(a.links, b, "full-access");
+      yield* seedParent(a);
+      const input = {
+        task: "Review the repository on available compute.",
+        placement: "auto",
+        target: { driverKind: boxClaude.driver, model: "claude-sonnet-4-6" },
+        clientRequestId: "auto-review",
+      };
+      const result = yield* a.call("delegate_task", input);
+      expect(result.isError, JSON.stringify(result.content)).toBe(false);
+      const delegated = result.structuredContent as {
+        taskId: NodeId;
+        remoteChild: { environmentId: string; threadId: ThreadId };
+      };
+      expect(delegated.remoteChild.environmentId).toBe(box.environmentId);
+      expect(yield* Ref.get(thread.launchedWith)).toMatchObject({
+        modelSelection: { instanceId: boxClaude.instanceId, model: "claude-sonnet-4-6" },
+      });
+      const retried = yield* a.call("delegate_task", input);
+      expect(retried.structuredContent).toMatchObject({ taskId: delegated.taskId });
+      yield* Ref.set(thread.reply, "Review complete on the worker.");
+      yield* Ref.set(thread.status, "completed");
+      yield* Deferred.succeed(thread.finished, undefined);
+      expect(yield* taskResult(a, delegated.taskId)).toMatchObject({
+        status: "completed",
+        result: "Review complete on the worker.",
+      });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
 
 it.effect("a task delegated to the box wakes the laptop's parent when it ends there", () =>
   Effect.scoped(

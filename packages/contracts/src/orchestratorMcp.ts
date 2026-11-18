@@ -170,6 +170,12 @@ export type OrchestratorMcpTerminalDelegatedTaskStatus =
 
 export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   task: OrchestratorMcpPrompt,
+  placement: Schema.optional(
+    Schema.Literal("auto").annotate({
+      description:
+        "Choose this machine or a linked machine by available CPU and memory. Requires matching repository and provider. Omit target.environmentId and target.projectId. Shared checkouts only; no file synchronization.",
+    }),
+  ),
   // Some providers send the whole target object as JSON text.
   target: Schema.optional(
     Schema.Union([OrchestratorMcpTarget, Schema.fromJsonString(OrchestratorMcpTarget)]),
@@ -629,6 +635,7 @@ export type OrchestratorMcpThreadInterruptResult = typeof OrchestratorMcpThreadI
 
 export const OrchestratorMcpCapabilitiesInput = Schema.Struct({
   environmentId: OrchestratorMcpEnvironmentTarget,
+  projectId: Schema.optional(ProjectId),
   search: Schema.optional(
     TrimmedNonEmptyString.check(Schema.isMaxLength(200)).annotate({
       description: "Match model ids and labels. Replaces the short list.",
