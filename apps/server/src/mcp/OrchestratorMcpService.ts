@@ -2677,6 +2677,9 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
+      yield* requireCapability(callerScope);
+      const delegationKey = yield* requestKey(input.clientRequestId);
+      input = { ...input, clientRequestId: delegationKey };
       if (input.placement === "auto") {
         const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
         const providers = yield* loadProviders;
@@ -2724,6 +2727,12 @@ const make = Effect.gen(function* () {
         );
         input = { ...input, placement: undefined, clientRequestId, target };
       }
+      const execution = yield* delegationPlacement.check(
+        yield* requireThreadScope(callerScope, "delegate_task"),
+        { ...input, clientRequestId: delegationKey },
+      );
+      const withEnvironment = (result: OrchestratorMcpDelegateTaskResult) =>
+        execution === undefined ? result : { ...result, environment: execution };
       const environmentId =
         input.target === undefined
           ? undefined
@@ -2736,9 +2745,11 @@ const make = Effect.gen(function* () {
           ...input,
           target: { ...input.target, environmentId },
         });
-        return yield* input.mode === "wait"
-          ? awaitTask(scope, taskId, taskId, input.timeoutMs)
-          : readTask(scope, taskId, false, true);
+        return withEnvironment(
+          yield* input.mode === "wait"
+            ? awaitTask(scope, taskId, taskId, input.timeoutMs)
+            : readTask(scope, taskId, false, true),
+        );
       }
       const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
       if (
@@ -2876,9 +2887,11 @@ const make = Effect.gen(function* () {
         });
       }
 
-      return yield* input.mode === "wait"
-        ? awaitTask(scope, taskId, key, input.timeoutMs)
-        : readTask(scope, taskId, false, true);
+      return withEnvironment(
+        yield* input.mode === "wait"
+          ? awaitTask(scope, taskId, key, input.timeoutMs)
+          : readTask(scope, taskId, false, true),
+      );
     }),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");

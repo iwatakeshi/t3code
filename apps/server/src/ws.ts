@@ -2248,6 +2248,13 @@ export const layerWsRpc = (
                     projection: projectThreadProjectionForWire(result.projection),
                   })),
                   Effect.catchTags({
+                    ThreadLaunchOsMismatchError: (cause) =>
+                      new OrchestrationV2ThreadLaunchError({
+                        commandId: input.commandId,
+                        projectId: input.projectId,
+                        message: cause.message,
+                        cause,
+                      }),
                     AttachmentClaimError: (cause) =>
                       new OrchestrationV2ThreadLaunchError({
                         commandId: input.commandId,

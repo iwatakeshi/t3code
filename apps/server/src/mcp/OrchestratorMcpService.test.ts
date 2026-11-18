@@ -84,7 +84,9 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
-  Layer.provide(Layer.mock(DelegationPlacement.DelegationPlacement)({})),
+  Layer.provide(
+    Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+  ),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -3553,7 +3555,9 @@ describe("OrchestratorMcpService provider resolution", () => {
       saved: ScheduledTask = tasks[0]!,
     ) =>
       OrchestratorMcpService.layer.pipe(
-        Layer.provide(Layer.mock(DelegationPlacement.DelegationPlacement)({})),
+        Layer.provide(
+          Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+        ),
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(
           Layer.mock(GitVcsDriver.GitVcsDriver)({
@@ -3789,7 +3793,9 @@ describe("OrchestratorMcpService provider resolution", () => {
       } = { project: existing.modelSelection },
     ) =>
       OrchestratorMcpService.layer.pipe(
-        Layer.provide(Layer.mock(DelegationPlacement.DelegationPlacement)({})),
+        Layer.provide(
+          Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+        ),
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)(git)),
         Layer.provide(

@@ -342,6 +342,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           });
         }
         const result = yield* ThreadMessageIntake.launchThread({
+          ...(input.requirements === undefined ? {} : { requirements: input.requirements }),
           commandId,
           threadId,
           projectId,
@@ -367,6 +368,11 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           ...(input.delegatedFrom === undefined ? {} : { delegatedFrom: input.delegatedFrom }),
         }).pipe(
           Effect.mapError((error) => {
+            if (error._tag === "ThreadLaunchOsMismatchError")
+              return new OrchestratorMcpFailure({
+                code: "no_compatible_environment",
+                message: error.message,
+              });
             if (error._tag === "AttachmentClaimError") {
               return new OrchestratorMcpFailure({
                 code: "orchestration_error",

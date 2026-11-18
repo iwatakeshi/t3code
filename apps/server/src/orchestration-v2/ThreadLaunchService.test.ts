@@ -5,6 +5,7 @@ import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as FileSystem from "effect/FileSystem";
 import * as ServerConfig from "../config.ts";
 import { createPendingAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
@@ -348,6 +349,36 @@ function launchInput(input: {
   };
 }
 
+it.effect.each([
+  { platform: "linux", os: "darwin", allowed: false },
+  { platform: "win32", os: "windows", allowed: true },
+  { platform: "linux", os: "linux", allowed: true },
+  { platform: "freebsd", os: "linux", allowed: false },
+] as const)(
+  "checks execution OS $platform against $os before accepting a launch",
+  ({ platform, os, allowed }) => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const input = {
+        ...launchInput({ command: "command:os", thread: "thread:os" }),
+        requirements: { os: [os] },
+      };
+      if (allowed) {
+        const result = yield* launches.launch(input);
+        assert.equal(result.threadId, input.threadId);
+      } else {
+        const error = yield* launches.launch(input).pipe(Effect.flip);
+        assert.equal(error._tag, "ThreadLaunchOsMismatchError");
+        const sql = yield* SqlClient.SqlClient;
+        const rows =
+          yield* sql`SELECT thread_id FROM orchestration_v2_projection_threads WHERE thread_id = ${input.threadId}`;
+        assert.equal(rows.length, 0);
+      }
+    }).pipe(Effect.provideService(HostProcess.Platform, platform), Effect.provide(harness.layer));
+  },
+);
+
 it.effect.each(
   (["new", "existing"] as const).flatMap((target) =>
     (["user", "agent"] as const).map((createdBy) => ({ target, createdBy })),
@@ -365,7 +396,7 @@ it.effect.each(
           Layer.mock(SecretRequests.SecretRequests)({}),
           ManagedPolicy.layerTest(),
           Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-          Layer.mock(DelegationPlacement.DelegationPlacement)({}),
+          Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
         ),
       ),
     );

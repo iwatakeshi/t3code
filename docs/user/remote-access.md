@@ -409,11 +409,23 @@ other machine needs this version of T3 Code, one registered project with the
 same repository, and the requested provider and model ready to run. These
 choices are independent of the app's load-balancing preferences.
 
+For platform-specific work, ask the agent to set an OS requirement, such as
+`requirements: { os: ["darwin"] }` for macOS. The other choices are `linux` and
+`windows`; more than one allows any of those systems. Leaving the requirement
+out allows any OS. This is where the agent and its commands execute, not the
+platform the code is built for, and it does not install tools such as Xcode.
+OS requirements apply to explicitly chosen machines too. Linked machines must
+advertise support for enforcing them; update an older server before using it
+for constrained work. Environment discovery and delegation replies report the
+machine's OS and architecture.
+
 Auto placement uses shared checkouts. Prepare the code on each machine before
 delegating: it does not copy files, fetch commits, or merge results. It cannot
 be combined with worktree isolation or an explicit destination. If no machine
 qualifies, the call fails without starting or queuing work. Repeating the same
-`clientRequestId` keeps the original destination.
+`clientRequestId` keeps the original destination and OS requirements. Changing
+or removing those requirements on a retry returns a conflict; use a new key
+for a different task.
 
 ## Manage or revoke access
 

@@ -1,9 +1,17 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { ExecutionEnvironmentDescriptor } from "./environment.ts";
+import { ExecutionEnvironmentDescriptor, ExecutionRequirements } from "./environment.ts";
 
 const decodeDescriptor = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
+
+it("accepts only nonempty allowlists of supported execution operating systems", () => {
+  const decode = Schema.decodeUnknownSync(ExecutionRequirements);
+  expect(decode({})).toEqual({});
+  expect(decode({ os: ["darwin", "linux", "windows"] }).os).toHaveLength(3);
+  for (const os of [[], ["win32"], ["unknown"], ["linux", "freebsd"]])
+    expect(() => decode({ os })).toThrow();
+});
 
 const descriptor = {
   environmentId: "environment-1",

@@ -7,6 +7,7 @@ import {
   type ChatAttachment,
   type MessageId,
   type ModelSelection,
+  type ExecutionRequirements,
   type OrchestrationV2Actor,
   type OrchestrationV2CreationSource,
   type OrchestrationV2DelegatedFrom,
@@ -33,6 +34,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import {
@@ -87,6 +89,7 @@ export interface ThreadLaunchInitialMessage {
 }
 
 export interface ThreadLaunchInput {
+  readonly requirements?: ExecutionRequirements;
   readonly commandId: CommandId;
   readonly threadId?: ThreadId;
   readonly reuseExistingThread?: boolean;
@@ -161,6 +164,15 @@ export class ThreadLaunchError extends Schema.TaggedError<ThreadLaunchError>()(
   }
 }
 
+export class ThreadLaunchOsMismatchError extends Schema.TaggedError<ThreadLaunchOsMismatchError>()(
+  "ThreadLaunchOsMismatchError",
+  { requiredOs: Schema.Array(Schema.String), actualOs: Schema.String },
+) {
+  override get message(): string {
+    return `This task requires ${this.requiredOs.join(" or ")}; this environment runs ${this.actualOs}. No thread was started.`;
+  }
+}
+
 export class ThreadLaunchBaseRefError extends Schema.TaggedError<ThreadLaunchBaseRefError>()(
   "ThreadLaunchBaseRefError",
   {
@@ -223,7 +235,9 @@ export class ThreadLaunchService extends Context.Service<
       input: ThreadLaunchInput,
     ) => Effect.Effect<
       ThreadLaunchResult,
-      ThreadLaunchError | ThreadManagement.ThreadManagementProviderInstanceDisabledError
+      | ThreadLaunchError
+      | ThreadLaunchOsMismatchError
+      | ThreadManagement.ThreadManagementProviderInstanceDisabledError
     >;
     /** Check a new worktree's base ref and branch name before creation for early errors; launch otherwise accepts and reports these failures inside the thread. */
     readonly checkWorktreeBase: (
@@ -1204,6 +1218,15 @@ const make = Effect.gen(function* () {
 
   const launch: ThreadLaunchService["Service"]["launch"] = Effect.fn("ThreadLaunchService.launch")(
     function* (request) {
+      if (request.requirements?.os !== undefined) {
+        const platform = yield* HostProcess.Platform;
+        const actualOs = platform === "win32" ? "windows" : platform;
+        if (!request.requirements.os.some((os) => os === actualOs))
+          return yield* new ThreadLaunchOsMismatchError({
+            requiredOs: request.requirements.os,
+            actualOs,
+          });
+      }
       // Scratch has no Git repository. Normalize before folder allocation so
       // durable preparation and retries use the thread's own Scratch folder.
       const input: ThreadLaunchInput =

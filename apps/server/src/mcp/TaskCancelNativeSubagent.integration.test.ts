@@ -219,7 +219,7 @@ const cancelBackgroundOnlyTask = (
             Layer.mock(ProjectService.ProjectService)({}),
             Layer.mock(SecretRequests.SecretRequests)({}),
             Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-            Layer.mock(DelegationPlacement.DelegationPlacement)({}),
+            Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
             ServerSettings.layerTest(),
             Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
             NodeServices.layer,

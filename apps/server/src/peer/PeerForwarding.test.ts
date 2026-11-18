@@ -221,7 +221,9 @@ const serveBox = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) =>
     box,
     Layer.mergeAll(
       McpHttpServer.layerOrchestratorToolkit.pipe(
-        Layer.provide(Layer.mock(DelegationPlacement.DelegationPlacement)({})),
+        Layer.provide(
+          Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+        ),
       ),
       McpHttpServer.layerProjectRegistration,
       McpHttpServer.layerThreadToolkit,
@@ -278,7 +280,9 @@ const makeLaptop = Effect.gen(function* () {
   const linking = yield* layerLinkingEnvironment(laptop).pipe(Layer.build);
   const layerHere = Layer.mergeAll(
     McpHttpServer.layerOrchestratorToolkit.pipe(
-      Layer.provide(Layer.mock(DelegationPlacement.DelegationPlacement)({})),
+      Layer.provide(
+        Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+      ),
     ),
     McpHttpServer.layerProjectRegistration,
     McpHttpServer.layerThreadToolkit,

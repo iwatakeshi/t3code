@@ -599,7 +599,12 @@ const make = Effect.gen(function* () {
       ),
     ).pipe(Effect.timeoutOption(LIST_PROBE_TIMEOUT), Effect.orElseSucceed(Option.none));
     if (Option.isNone(answered)) return { ...link, status: "unreachable" };
-    return { ...(yield* withLabel(link, answered.value.label)), status: "reachable" };
+    return {
+      ...(yield* withLabel(link, answered.value.label)),
+      status: "reachable",
+      platform: answered.value.platform,
+      executionOsRequirements: answered.value.capabilities.executionOsRequirements === true,
+    };
   });
 
   const list: PeerLinks["Service"]["list"] = Effect.gen(function* () {

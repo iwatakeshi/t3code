@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
+import { ExecutionEnvironmentPlatform, ExecutionRequirements } from "./environment.ts";
 
 import { AuthMcpClientAccess } from "./auth.ts";
 import {
@@ -170,6 +171,7 @@ export type OrchestratorMcpTerminalDelegatedTaskStatus =
 
 export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   task: OrchestratorMcpPrompt,
+  requirements: Schema.optional(ExecutionRequirements),
   placement: Schema.optional(
     Schema.Literal("auto").annotate({
       description:
@@ -222,6 +224,13 @@ const OrchestratorMcpExecutedModel = Schema.NullOr(Schema.String).annotate({
 
 export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   taskId: NodeId,
+  environment: Schema.optional(
+    Schema.Struct({
+      environmentId: EnvironmentId,
+      label: Schema.String,
+      platform: ExecutionEnvironmentPlatform,
+    }),
+  ),
   /** Null for a task that runs in a linked environment; see `remoteChild`. */
   childThreadId: Schema.NullOr(ThreadId),
   /** The linked environment and thread a remote task runs as. */
@@ -681,6 +690,8 @@ export const OrchestratorMcpEnvironmentLink = Schema.Struct({
   access: AuthMcpClientAccess,
   expiresAt: IsoDateTime,
   lastError: Schema.NullOr(Schema.String),
+  platform: Schema.optional(ExecutionEnvironmentPlatform),
+  executionOsRequirements: Schema.optional(Schema.Boolean),
 });
 export type OrchestratorMcpEnvironmentLink = typeof OrchestratorMcpEnvironmentLink.Type;
 
@@ -967,6 +978,9 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "orchestration_error",
       "thread_credential_required",
       "target_required",
+      "no_compatible_environment",
+      "no_available_capacity",
+      "request_conflict",
     ]),
     message: Schema.String,
   },

@@ -351,6 +351,7 @@ const make = Effect.gen(function* () {
         {
           projectId,
           title,
+          ...(input.requirements === undefined ? {} : { requirements: input.requirements }),
           modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
           ...(runtimeMode === undefined ? {} : { runtimeMode }),
           ...(interactionMode === undefined ? {} : { interactionMode }),

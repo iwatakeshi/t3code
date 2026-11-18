@@ -272,6 +272,10 @@ const make = Effect.gen(function* () {
           access: link.access,
           expiresAt: DateTime.formatIso(link.expiresAt),
           lastError: link.lastError,
+          ...(link.platform === undefined ? {} : { platform: link.platform }),
+          ...(link.executionOsRequirements === undefined
+            ? {}
+            : { executionOsRequirements: link.executionOsRequirements }),
         })),
         notListed: NOT_LISTED,
       };

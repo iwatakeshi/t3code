@@ -1,5 +1,7 @@
 import {
   type ModelSelection,
+  type ExecutionEnvironmentPlatform,
+  ExecutionRequirements,
   OrchestratorMcpCapabilitiesInput,
   OrchestratorMcpCapabilitiesResult,
   type OrchestratorMcpDelegateTaskInput,
@@ -26,6 +28,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as PeerForwarding from "./PeerForwarding.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 
 type Scope = McpInvocationContext.McpThreadInvocationScope;
 
@@ -39,6 +42,18 @@ const CapabilitiesTool = Tool.make("orchestrator_capabilities", {
 export class DelegationPlacement extends Context.Service<
   DelegationPlacement,
   {
+    readonly check: (
+      scope: Scope,
+      input: OrchestratorMcpDelegateTaskInput & { readonly clientRequestId: string },
+    ) => Effect.Effect<
+      | {
+          readonly environmentId: Scope["environmentId"];
+          readonly label: string;
+          readonly platform: ExecutionEnvironmentPlatform;
+        }
+      | undefined,
+      OrchestratorMcpFailure
+    >;
     readonly select: (
       scope: Scope,
       input: OrchestratorMcpDelegateTaskInput & { readonly clientRequestId: string },
@@ -64,8 +79,99 @@ const make = Effect.gen(function* () {
   const identities = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
   const resources = yield* HostResources.HostResources;
   const sql = yield* SqlClient.SqlClient;
+  const environment = yield* ServerEnvironment.ServerEnvironment;
   const decodeTarget = Schema.decodeUnknownEffect(Schema.fromJsonString(OrchestratorMcpTarget));
   const encodeTarget = Schema.encodeEffect(Schema.fromJsonString(OrchestratorMcpTarget));
+  const encodeRequirements = Schema.encodeEffect(Schema.fromJsonString(ExecutionRequirements));
+  const requirementsJson = (requirements: ExecutionRequirements | undefined) =>
+    encodeRequirements(
+      requirements?.os === undefined ? {} : { os: [...new Set(requirements.os)].sort() },
+    ).pipe(Effect.mapError(placementFailure));
+  const readPlacement = Effect.fn("DelegationPlacement.readPlacement")(function* (
+    scope: Scope,
+    key: string,
+    requirements: string,
+  ) {
+    const rows = yield* sql<{ readonly target_json: string; readonly requirements_json: string }>`
+      SELECT target_json, requirements_json FROM delegated_task_placements
+      WHERE request_namespace = ${scope.requestNamespace}
+        AND parent_thread_id = ${scope.thread.threadId}
+        AND client_request_id = ${key}
+    `.pipe(Effect.mapError(placementFailure));
+    if (rows[0] === undefined) return undefined;
+    if (rows[0].requirements_json !== requirements)
+      return yield* new OrchestratorMcpFailure({
+        code: "request_conflict",
+        message:
+          "This clientRequestId already has different execution requirements. Use a new key for a different task.",
+      });
+    return yield* decodeTarget(rows[0].target_json).pipe(Effect.mapError(placementFailure));
+  });
+  const pin = Effect.fn("DelegationPlacement.pin")(function* (
+    scope: Scope,
+    key: string,
+    requirements: string,
+    target: OrchestratorMcpTarget,
+  ) {
+    const targetJson = yield* encodeTarget(target).pipe(Effect.mapError(placementFailure));
+    yield* sql`
+      INSERT INTO delegated_task_placements (request_namespace, parent_thread_id, client_request_id, target_json, requirements_json)
+      VALUES (${scope.requestNamespace}, ${scope.thread.threadId}, ${key}, ${targetJson}, ${requirements})
+      ON CONFLICT DO NOTHING
+    `.pipe(Effect.mapError(placementFailure));
+    return yield* readPlacement(scope, key, requirements);
+  });
+  const check: DelegationPlacement["Service"]["check"] = Effect.fn("DelegationPlacement.check")(
+    function* (scope, input) {
+      const requirements = yield* requirementsJson(input.requirements);
+      const existing = yield* readPlacement(scope, input.clientRequestId, requirements);
+      const destination = input.target?.environmentId ?? scope.environmentId;
+      if (existing !== undefined && (existing.environmentId ?? scope.environmentId) !== destination)
+        return yield* new OrchestratorMcpFailure({
+          code: "request_conflict",
+          message:
+            "This clientRequestId already targets a different environment. Use a new key for a different task.",
+        });
+      const descriptor =
+        destination === scope.environmentId
+          ? yield* environment.getDescriptor
+          : (yield* forwarding.links(scope)).links.find(
+              (link) => link.environmentId === destination && link.status === "reachable",
+            );
+      const platform = descriptor?.platform;
+      if (input.requirements?.os !== undefined) {
+        const supported =
+          destination === scope.environmentId ||
+          (descriptor !== undefined &&
+            "executionOsRequirements" in descriptor &&
+            descriptor.executionOsRequirements === true);
+        if (!supported)
+          return yield* new OrchestratorMcpFailure({
+            code: "capability_denied",
+            message:
+              "The destination cannot enforce OS requirements. Update T3 Code there and check the link; no task was started.",
+          });
+        if (platform === undefined || !input.requirements.os.some((os) => os === platform.os))
+          return yield* new OrchestratorMcpFailure({
+            code: "no_compatible_environment",
+            message: `This task requires ${input.requirements.os.join(" or ")}; the destination runs ${platform?.os ?? "an unknown OS"}. No task was started.`,
+          });
+      }
+      const pinned = yield* pin(scope, input.clientRequestId, requirements, {
+        ...input.target,
+        environmentId: destination,
+      });
+      if (pinned?.environmentId !== destination)
+        return yield* new OrchestratorMcpFailure({
+          code: "request_conflict",
+          message:
+            "This clientRequestId already targets a different environment. Use a new key for a different task.",
+        });
+      return platform === undefined || descriptor === undefined
+        ? undefined
+        : { environmentId: destination, label: descriptor.label, platform };
+    },
+  );
 
   const select: DelegationPlacement["Service"]["select"] = Effect.fn("DelegationPlacement.select")(
     function* (scope, input, parent, localTarget) {
@@ -82,19 +188,10 @@ const make = Effect.gen(function* () {
             'Auto placement supports shared checkouts only. For isolation "worktree", choose a machine explicitly.',
         });
       }
-      const read = sql<{ readonly target_json: string }>`
-        SELECT target_json FROM delegated_task_placements
-        WHERE request_namespace = ${scope.requestNamespace}
-          AND parent_thread_id = ${scope.thread.threadId}
-          AND client_request_id = ${input.clientRequestId}
-      `.pipe(
-        Effect.flatMap((rows) =>
-          rows[0] === undefined ? Effect.undefined : decodeTarget(rows[0].target_json),
-        ),
-        Effect.mapError(placementFailure),
-      );
-      const existing = yield* read;
+      const requirements = yield* requirementsJson(input.requirements);
+      const existing = yield* readPlacement(scope, input.clientRequestId, requirements);
       if (existing !== undefined) return existing;
+      const localDescriptor = yield* environment.getDescriptor;
 
       // Use the same link checks and access limits as an explicitly targeted delegation.
       const linked = yield* forwarding.links(scope);
@@ -126,7 +223,9 @@ const make = Effect.gen(function* () {
               ).values(),
             ];
       const local =
-        localTarget === undefined
+        localTarget === undefined ||
+        (input.requirements?.os !== undefined &&
+          !input.requirements.os.some((os) => os === localDescriptor.platform.os))
           ? []
           : [
               {
@@ -146,6 +245,9 @@ const make = Effect.gen(function* () {
           (link) =>
             link.status === "reachable" &&
             link.access !== "read-only" &&
+            (input.requirements?.os === undefined ||
+              (link.executionOsRequirements === true &&
+                input.requirements.os.some((os) => os === link.platform?.os))) &&
             (input.runtimeMode === undefined ||
               input.runtimeMode === "inherit" ||
               runtimeModeRank(input.runtimeMode) <= runtimeModeRank(link.access)),
@@ -244,25 +346,19 @@ const make = Effect.gen(function* () {
       const candidate = candidates.find((candidate) => candidate.environmentId === selected);
       if (candidate === undefined) {
         return yield* new OrchestratorMcpFailure({
-          code: "provider_unavailable",
+          code: candidates.length === 0 ? "no_compatible_environment" : "no_available_capacity",
           message:
-            "No machine is ready for Auto placement. Link machines with this repository and provider, update them to support environment resources, or choose a machine explicitly. No task was started.",
+            candidates.length === 0
+              ? `No compatible machine has this repository, provider, model and execution requirements${input.requirements?.os === undefined ? "" : ` (${input.requirements.os.join(" or ")})`}. Available operating systems: ${[localDescriptor.platform.os, ...linked.links.flatMap((link) => link.platform?.os ?? [])].join(", ")}. No task was started.`
+              : "Compatible machines have no available CPU or memory capacity. No task was started or queued.",
         });
       }
       // Pin before launching: retries and concurrent calls must never start this request on two machines.
-      const targetJson = yield* encodeTarget(candidate.target).pipe(
-        Effect.mapError(placementFailure),
-      );
-      yield* sql`
-        INSERT INTO delegated_task_placements (request_namespace, parent_thread_id, client_request_id, target_json)
-        VALUES (${scope.requestNamespace}, ${scope.thread.threadId}, ${input.clientRequestId}, ${targetJson})
-        ON CONFLICT DO NOTHING
-      `.pipe(Effect.mapError(placementFailure));
-      const pinned = yield* read;
+      const pinned = yield* pin(scope, input.clientRequestId, requirements, candidate.target);
       return pinned ?? candidate.target;
     },
   );
-  return DelegationPlacement.of({ select });
+  return DelegationPlacement.of({ select, check });
 });
 
 export const layer = Layer.effect(DelegationPlacement, make);

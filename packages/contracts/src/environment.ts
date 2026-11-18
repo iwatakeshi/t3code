@@ -58,6 +58,18 @@ export const WorktreeSubmodules = Schema.Literals(["recursive", "top-level", "no
 export type WorktreeSubmodules = typeof WorktreeSubmodules.Type;
 export type ExecutionEnvironmentPlatform = typeof ExecutionEnvironmentPlatform.Type;
 
+export const ExecutionRequirements = Schema.Struct({
+  os: Schema.optional(
+    Schema.Array(Schema.Literals(["darwin", "linux", "windows"]))
+      .check(Schema.isMinLength(1))
+      .annotate({
+        description:
+          "Allowed operating systems where the agent and commands execute. Omit for no restriction; does not install tools.",
+      }),
+  ),
+});
+export type ExecutionRequirements = typeof ExecutionRequirements.Type;
+
 export const ServerSelfUpdateMethod = Schema.Literals(["boot-service", "respawn", "desktop-app"]);
 export type ServerSelfUpdateMethod = typeof ServerSelfUpdateMethod.Type;
 
@@ -210,6 +222,7 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   shellOlderSettled: Schema.optionalKey(Schema.Boolean),
   /** Publishes a pull request refresh when linked-thread answers change; older servers need polling. */
   linkedThreadRefreshes: Schema.optionalKey(Schema.Boolean),
+  executionOsRequirements: Schema.optionalKey(Schema.Boolean),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

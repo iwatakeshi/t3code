@@ -23,6 +23,7 @@ import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolv
 import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as DelegationPlacement from "./DelegationPlacement.ts";
 import * as PeerForwarding from "./PeerForwarding.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 
 const here = EnvironmentId.make("local");
 const there = EnvironmentId.make("remote");
@@ -67,6 +68,8 @@ const link: OrchestratorMcpEnvironmentLink = {
   access: "full-access",
   expiresAt: "2030-01-01T00:00:00.000Z",
   lastError: null,
+  platform: { os: "linux", arch: "x64" },
+  executionOsRequirements: true,
 };
 
 const setup = Effect.gen(function* () {
@@ -81,6 +84,15 @@ const setup = Effect.gen(function* () {
   const calls = yield* Ref.make<ReadonlyArray<string>>([]);
   const database = yield* Sqlite.layerMemory.pipe(Layer.build);
   const dependencies = Layer.mergeAll(
+    Layer.mock(ServerEnvironment.ServerEnvironment)({
+      getDescriptor: Effect.succeed({
+        environmentId: here,
+        label: "Local",
+        platform: { os: "darwin", arch: "arm64" },
+        serverVersion: "test",
+        capabilities: { repositoryIdentity: true, executionOsRequirements: true },
+      }),
+    }),
     Layer.succeedContext(database),
     Layer.mock(HostResources.HostResources)({
       read: Ref.get(state).pipe(Effect.map((s) => s.local)),
@@ -202,7 +214,7 @@ it.effect("fails without launching or pinning when no machine qualifies", () =>
     const error = yield* service
       .select(scope, { task: "Checks", clientRequestId: "none" }, parent, undefined)
       .pipe(Effect.flip);
-    expect(error.code).toBe("provider_unavailable");
+    expect(error.code).toBe("no_compatible_environment");
     expect(yield* sql`SELECT * FROM delegated_task_placements`).toHaveLength(0);
   }),
 );
@@ -273,4 +285,136 @@ it.effect("preserves model options across instances and rejects incompatible pee
     );
     expect(incompatible.environmentId).toBe(here);
   }),
+);
+
+it.effect("filters by OS before capacity and excludes peers that cannot enforce requirements", () =>
+  Effect.gen(function* () {
+    const { service, state } = yield* setup;
+    yield* Ref.update(state, (s) => ({ ...s, local: { ...snapshot, cpuUtilization: 0 } }));
+    const linux = yield* service.select(
+      scope,
+      { task: "Linux tests", clientRequestId: "linux", requirements: { os: ["linux"] } },
+      parent,
+      {},
+    );
+    expect(linux.environmentId).toBe(there);
+    const mac = yield* service.select(
+      scope,
+      { task: "Mac tests", clientRequestId: "mac", requirements: { os: ["darwin"] } },
+      parent,
+      {},
+    );
+    expect(mac.environmentId).toBe(here);
+    yield* Ref.update(state, (s) => ({
+      ...s,
+      links: [{ ...link, executionOsRequirements: false }],
+    }));
+    const oldPeer = yield* service
+      .select(
+        scope,
+        { task: "Linux tests", clientRequestId: "old", requirements: { os: ["linux"] } },
+        parent,
+        {},
+      )
+      .pipe(Effect.flip);
+    expect(oldPeer.code).toBe("no_compatible_environment");
+  }),
+);
+
+it.effect(
+  "distinguishes incompatible execution from unavailable capacity without pinning work",
+  () =>
+    Effect.gen(function* () {
+      const { service, state, sql } = yield* setup;
+      yield* Ref.update(state, (s) => ({ ...s, remote: { ...snapshot, cpuUtilization: 1 } }));
+      for (const [os, expected] of [
+        ["linux", "no_available_capacity"],
+        ["windows", "no_compatible_environment"],
+      ] as const) {
+        const error = yield* service
+          .select(
+            scope,
+            { task: "Tests", clientRequestId: os, requirements: { os: [os] } },
+            parent,
+            {},
+          )
+          .pipe(Effect.flip);
+        expect(error.code).toBe(expected);
+      }
+      expect(yield* sql`SELECT * FROM delegated_task_placements`).toHaveLength(0);
+    }),
+);
+
+it.effect("validates explicit destinations and returns their actual platform", () =>
+  Effect.gen(function* () {
+    const { service, state } = yield* setup;
+    const local = yield* service.check(scope, {
+      task: "Tests",
+      clientRequestId: "local",
+      requirements: { os: ["darwin"] },
+    });
+    expect(local).toMatchObject({ environmentId: here, platform: { os: "darwin", arch: "arm64" } });
+    const remote = {
+      task: "Tests",
+      clientRequestId: "remote",
+      target: { environmentId: there },
+      requirements: { os: ["linux"] as const },
+    };
+    expect(yield* service.check(scope, remote)).toMatchObject({
+      environmentId: there,
+      platform: { os: "linux" },
+    });
+    const mismatch = yield* service
+      .check(scope, { ...remote, clientRequestId: "wrong", requirements: { os: ["windows"] } })
+      .pipe(Effect.flip);
+    expect(mismatch.code).toBe("no_compatible_environment");
+    yield* Ref.update(state, (s) => ({
+      ...s,
+      links: [{ ...link, executionOsRequirements: false }],
+    }));
+    const old = yield* service
+      .check(scope, { ...remote, clientRequestId: "old" })
+      .pipe(Effect.flip);
+    expect(old.code).toBe("capability_denied");
+  }),
+);
+
+it.effect(
+  "pins normalized requirements and refuses changes, removal and retargeting on retry",
+  () =>
+    Effect.gen(function* () {
+      const { service, rebuild } = yield* setup;
+      const input = {
+        task: "Tests",
+        clientRequestId: "retry",
+        target: { environmentId: there },
+        requirements: { os: ["linux", "windows"] as const },
+      };
+      yield* service.check(scope, input);
+      const restarted = yield* rebuild;
+      expect(
+        yield* restarted.check(scope, {
+          ...input,
+          requirements: { os: ["windows", "linux", "linux"] },
+        }),
+      ).toMatchObject({ environmentId: there });
+      for (const changed of [
+        { ...input, requirements: { os: ["darwin"] as const } },
+        { ...input, requirements: undefined },
+        { ...input, target: { environmentId: here } },
+      ]) {
+        const error = yield* restarted.check(scope, changed).pipe(Effect.flip);
+        expect(error.code).toBe("request_conflict");
+      }
+      const auto = {
+        task: "Tests",
+        clientRequestId: "auto-retry",
+        requirements: { os: ["linux"] as const },
+      };
+      yield* service.select(scope, auto, parent, {});
+      const changed = yield* restarted
+        .select(scope, { ...auto, requirements: { os: ["darwin"] } }, parent, {})
+        .pipe(Effect.flip);
+      expect(changed.code).toBe("request_conflict");
+    }),
 );

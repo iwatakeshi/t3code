@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 
 import { AuthMcpClientAccess } from "./auth.ts";
 import { EnvironmentId, ThreadId, TrimmedNonEmptyString, TurnItemId } from "./baseSchemas.ts";
+import { ExecutionEnvironmentPlatform } from "./environment.ts";
 
 /**
  * A link from this environment to another one (the peer). This environment
@@ -29,6 +30,8 @@ export type PeerLinkStatus = typeof PeerLinkStatus.Type;
 export const PeerLinkSummary = Schema.Struct({
   ...PeerLink.fields,
   status: PeerLinkStatus,
+  platform: Schema.optional(ExecutionEnvironmentPlatform),
+  executionOsRequirements: Schema.optional(Schema.Boolean),
 });
 export type PeerLinkSummary = typeof PeerLinkSummary.Type;
 

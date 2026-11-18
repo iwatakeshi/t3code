@@ -78,7 +78,7 @@ import * as PeerLinkRequests from "./PeerLinkRequests.ts";
 // would for a local child.
 
 const laptop = descriptorOf("environment-laptop", "Laptop");
-const box = descriptorOf("environment-box", "Box");
+const box = descriptorOf("environment-box", "Box", { executionOsRequirements: true });
 const boxProject = ProjectId.make("project:box");
 const instanceId = ProviderInstanceId.make("codex");
 const driver = ProviderDriverKind.make("codex");
@@ -86,7 +86,7 @@ const modelSelection = { instanceId, model: "gpt-5.4" };
 
 type LaunchedWith = Pick<
   ThreadLaunch.ThreadLaunchInput,
-  "modelSelection" | "runtimeMode" | "interactionMode"
+  "modelSelection" | "runtimeMode" | "interactionMode" | "requirements"
 >;
 
 /** The thread the box launches for the task, which the test finishes. */
@@ -517,6 +517,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
                 modelSelection: input.modelSelection,
                 runtimeMode: input.runtimeMode,
                 interactionMode: input.interactionMode,
+                ...(input.requirements === undefined ? {} : { requirements: input.requirements }),
               }),
             ),
             Effect.andThen(Effect.flatten(Ref.get(thread.afterLaunch))),
@@ -571,7 +572,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
     Layer.provide(
       Layer.merge(
         Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-        Layer.mock(DelegationPlacement.DelegationPlacement)({}),
+        Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
       ),
     ),
     Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
@@ -982,9 +983,20 @@ it.effect("Auto placement delegates through the peer transport and returns the r
       const input = {
         task: "Review the repository on available compute.",
         placement: "auto",
+        requirements: { os: ["linux"] },
         target: { driverKind: boxClaude.driver, model: "claude-sonnet-4-6" },
         clientRequestId: "auto-review",
       };
+      const discovery = yield* a.call("t3_environment_links", {});
+      expect(discovery.structuredContent).toMatchObject({
+        links: [
+          {
+            environmentId: box.environmentId,
+            platform: { os: "linux", arch: "x64" },
+            executionOsRequirements: true,
+          },
+        ],
+      });
       const result = yield* a.call("delegate_task", input);
       expect(result.isError, JSON.stringify(result.content)).toBe(false);
       const delegated = result.structuredContent as {
@@ -992,11 +1004,23 @@ it.effect("Auto placement delegates through the peer transport and returns the r
         remoteChild: { environmentId: string; threadId: ThreadId };
       };
       expect(delegated.remoteChild.environmentId).toBe(box.environmentId);
+      expect(result.structuredContent).toMatchObject({
+        environment: { environmentId: box.environmentId, platform: { os: "linux", arch: "x64" } },
+      });
       expect(yield* Ref.get(thread.launchedWith)).toMatchObject({
         modelSelection: { instanceId: boxClaude.instanceId, model: "claude-sonnet-4-6" },
+        requirements: { os: ["linux"] },
       });
       const retried = yield* a.call("delegate_task", input);
       expect(retried.structuredContent).toMatchObject({ taskId: delegated.taskId });
+      const conflict = yield* a.call("delegate_task", {
+        ...input,
+        requirements: { os: ["darwin"] },
+      });
+      expect(conflict.isError).toBe(true);
+      expect(conflict.content).toMatchObject([
+        { text: expect.stringContaining("request_conflict") },
+      ]);
       yield* Ref.set(thread.reply, "Review complete on the worker.");
       yield* Ref.set(thread.status, "completed");
       yield* Deferred.succeed(thread.finished, undefined);
