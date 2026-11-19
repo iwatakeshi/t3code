@@ -13,7 +13,7 @@ import type {
   ServerProvider,
 } from "@t3tools/contracts";
 import { msg, T, useGT, useMessages, Var } from "gt-react";
-import { lazy, Suspense, useRef, useState } from "react";
+import { lazy, Suspense, useRef, useState, useEffect, useEffectEvent } from "react";
 import { CopyIcon } from "lucide-react";
 
 import { writeTextToClipboard } from "../../hooks/useCopyToClipboard";
@@ -169,6 +169,24 @@ export function ProviderAuthenticationSection({
       setError(gt("Could not open the sign-in page. Copy the link and open it in your browser."));
     }
   }
+
+  const openedFlow = useRef<string | null>(null);
+  const openSignInPage = useEffectEvent(() => {
+    void openBrowser();
+  });
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- opens the provider's external OAuth page once the remote login command supplies it
+  useEffect(() => {
+    if (
+      provider.driver !== "antigravity" ||
+      interaction?.type !== "browser" ||
+      auth?.phase !== "waiting" ||
+      !auth.flowId ||
+      openedFlow.current === auth.flowId
+    )
+      return;
+    openedFlow.current = auth.flowId;
+    openSignInPage();
+  }, [provider.driver, interaction?.type, auth?.phase, auth?.flowId]);
 
   function updateDraft(name: string, value: string) {
     setDraft({ id: draftId, values: { ...values, [name]: value } });
@@ -485,11 +503,15 @@ export function ProviderAuthenticationSection({
               }}
             >
               <label className="grid gap-1">
-                <T>If the final localhost page does not load, paste its full URL here.</T>
+                {provider.driver === "antigravity" ? (
+                  <T>Authorization code or return URL</T>
+                ) : (
+                  <T>If the final localhost page does not load, paste its full URL here.</T>
+                )}
                 <Input
                   size="sm"
                   id={`provider-callback-${instanceId}`}
-                  type="url"
+                  type={provider.driver === "antigravity" ? "text" : "url"}
                   autoComplete="off"
                   value={values.callback ?? ""}
                   disabled={disabled}

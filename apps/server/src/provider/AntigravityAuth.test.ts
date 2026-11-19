@@ -165,7 +165,7 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
 });
 
 it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth", (it) => {
-  it.effect("keeps native terminal login private and verifies ACP only after login exits", () =>
+  it.effect("keeps native browser login private and verifies ACP only after login exits", () =>
     Effect.gen(function* () {
       const loggedIn = yield* Deferred.make<void>();
       const harness = yield* makeHarness({
@@ -173,9 +173,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
           Effect.gen(function* () {
             yield* publish(
               {
-                type: "terminal",
+                type: "browser",
                 id: "google-login",
-                output: "Open Google and paste the return URL",
+                url: authorizationUrl,
+                requiresConsent: false,
+                acceptsCallback: true,
               },
               () => Deferred.succeed(loggedIn, undefined).pipe(Effect.asVoid),
             );
@@ -184,20 +186,18 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth"
       });
       const state = yield* harness.auth.controller.start(owner);
       const waiting = yield* phase(harness.auth, "waiting");
-      assert.equal(waiting.interaction?.type, "terminal");
+      assert.equal(waiting.interaction?.type, "browser");
       assert.deepEqual(harness.events, []);
       const hidden = yield* harness.auth.controller.subscribe(otherOwner).pipe(Stream.runHead);
       assert.isNull(Option.getOrThrow(hidden).interaction);
       const response = {
-        instanceId,
         flowId: state.flowId!,
-        interactionId: "google-login",
-        response: { type: "terminal" as const, data: "return-url\r" },
+        callbackUrl,
       };
       assert.isTrue(
-        Exit.isFailure(yield* Effect.exit(harness.auth.controller.respond!(otherOwner, response))),
+        Exit.isFailure(yield* Effect.exit(harness.auth.controller.complete(otherOwner, response))),
       );
-      yield* harness.auth.controller.respond!(owner, response);
+      yield* harness.auth.controller.complete(owner, response);
       yield* Deferred.await(harness.authenticateCalled);
       yield* Deferred.succeed(harness.authenticated, undefined);
       yield* Deferred.succeed(harness.discovered, undefined);

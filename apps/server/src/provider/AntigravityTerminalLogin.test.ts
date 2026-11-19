@@ -7,8 +7,12 @@ import * as Exit from "effect/Exit";
 import type * as PtyAdapter from "@t3tools/shared/PtyAdapter";
 import { runAntigravityTerminalLogin } from "./AntigravityTerminalLogin.ts";
 
+const authorizationUrl =
+  "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&state=test-state&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback";
+const callbackUrl = "https://antigravity.google/oauth-callback?code=return-code&state=test-state";
+
 it.effect.each(["exit", "cancel", "failure"] as const)(
-  "closes the native login terminal on %s and bounds its output",
+  "relays a chunked Google link privately and closes the native login process on %s",
   (end) =>
     Effect.gen(function* () {
       const ready = yield* Deferred.make<void>();
@@ -42,6 +46,7 @@ it.effect.each(["exit", "cancel", "failure"] as const)(
                   },
                   onData: (callback) => {
                     data = callback;
+                    Deferred.doneUnsafe(ready, Effect.void);
                     return () => {
                       detached++;
                     };
@@ -57,27 +62,42 @@ it.effect.each(["exit", "cancel", "failure"] as const)(
           },
           publish: (interaction, respond) =>
             Effect.gen(function* () {
-              if (interaction.type !== "terminal") return;
-              if (interaction.output === "") {
-                yield* respond({ type: "terminal", data: "return-code\r" });
-                yield* Deferred.succeed(ready, undefined);
-              } else {
-                assert.equal(interaction.output.length, 16_384);
-                assert.notInclude(interaction.output, "return-code");
-                yield* Deferred.succeed(rendered, undefined);
+              assert.equal(interaction.type, "browser");
+              if (interaction.type !== "browser") return;
+              assert.equal(interaction.url, authorizationUrl);
+              if (end === "exit") {
+                for (const callback of [
+                  callbackUrl.replace("test-state", "wrong"),
+                  callbackUrl.replace("antigravity.google", "example.com"),
+                  "code\ncommand",
+                  "x".repeat(16_385),
+                ]) {
+                  assert.isTrue(
+                    Exit.isFailure(
+                      yield* Effect.exit(respond({ type: "credentials", values: { callback } })),
+                    ),
+                  );
+                }
+                assert.deepEqual(input, []);
               }
+              yield* respond({
+                type: "credentials",
+                values: { callback: end === "exit" ? callbackUrl : "return-code" },
+              });
+              yield* Deferred.succeed(rendered, undefined);
             }),
         }),
       ).pipe(Effect.forkChild);
       yield* Deferred.await(ready);
-      data("x".repeat(20_000));
+      data("x".repeat(20_000) + "\r\nOpen Google: " + authorizationUrl.slice(0, 70));
+      data(authorizationUrl.slice(70) + "\x1b[0m\r\nPaste the code:");
       yield* Deferred.await(rendered);
       if (end !== "cancel") {
         exit({ exitCode: end === "exit" ? 0 : 1, signal: null });
         const result = yield* Effect.exit(Fiber.join(login));
         assert.equal(Exit.isSuccess(result), end === "exit");
       } else yield* Fiber.interrupt(login);
-      assert.deepEqual(input, ["return-code\r"]);
+      assert.deepEqual(input, [(end === "exit" ? callbackUrl : "return-code") + "\r"]);
       assert.equal(killed, 1);
       assert.equal(detached, 2);
     }),

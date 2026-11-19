@@ -477,6 +477,18 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
       const pending = yield* lock.withPermits(1)(
         Effect.gen(function* () {
           const flow = yield* requireFlow(ownerSessionId, input.flowId, "complete");
+          if (flow.respond && flow.state.interaction?.type === "browser" && !flow.callbackSent) {
+            yield* flow.respond({ type: "credentials", values: { callback: input.callbackUrl } });
+            flow.callbackSent = true;
+            yield* publishFlow(flow, {
+              ...flow.state,
+              phase: "verifying",
+              interaction: null,
+              authorizationUrl: null,
+              message: "Waiting for Google to finish sign-in.",
+            });
+            return { flow, forwarding: undefined };
+          }
           if (!flow.pending || flow.callbackSent) {
             return yield* setupError(
               "complete",
@@ -514,6 +526,7 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
           return { flow, forwarding };
         }),
       );
+      if (pending.forwarding === undefined) return pending.flow.state;
       const forwarded = yield* Fiber.await(pending.forwarding);
       if (Exit.isFailure(forwarded)) {
         return yield* setupError("complete", FORWARDING_FAILED_MESSAGE);
