@@ -6,6 +6,9 @@ import {
   settingsSecretLiteral,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as PtyAdapter from "@t3tools/shared/PtyAdapter";
+import * as Option from "effect/Option";
+import { runAntigravityTerminalLogin } from "../AntigravityTerminalLogin.ts";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import {
   NodeRuntimeUnavailableError,
@@ -384,6 +387,7 @@ export const AntigravityDriver: ProviderDriver<
       yield* runtime.drainEvents;
     }, Effect.scoped);
 
+    const pty = yield* Effect.serviceOption(PtyAdapter.PtyAdapter);
     const authFlow: AntigravityAuth = yield* makeAntigravityAuth({
       instanceId,
       makeRuntime: makeDisposableRuntime,
@@ -394,6 +398,46 @@ export const AntigravityDriver: ProviderDriver<
         ),
       onSignedOut: Effect.suspend(() => provider.onSignedOut),
       usesBrowser: antigravityAuthUsesBrowser(auth.authMethod),
+      nativeLogin: Effect.fn("AntigravityDriver.nativeLogin")(
+        function* (publish) {
+          const executable = yield* installation.acquire(settings.binaryPath, processEnvironment);
+          if (executable.harnessPath !== null) return;
+          const profile = yield* prepareAntigravityProfile({
+            profileDirectory,
+            baseEnv: processEnvironment,
+            auth,
+            userHome,
+            tempDirectory: directories.runtimeTemp,
+          });
+          yield* runAntigravityTerminalLogin({
+            instanceId,
+            pty: Option.getOrNull(pty),
+            spawn: {
+              ...buildAntigravityAcpSpawnInput({
+                installation: executable,
+                profile,
+                cwd: profile.acpDirectory,
+                baseEnv: processEnvironment,
+                auth,
+              }),
+              cwd: profile.acpDirectory,
+            },
+            publish,
+          });
+        },
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.mapError(
+          (cause) =>
+            new ProviderSetupError({
+              instanceId,
+              operation: "start",
+              detail: "Could not prepare Antigravity sign-in on this environment.",
+              cause,
+            }),
+        ),
+      ),
     });
 
     // The probe must not spawn. The agent is a PyInstaller one-file bundle

@@ -2,7 +2,13 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Layer from "effect/Layer";
 import { assert, it } from "@effect/vitest";
-import { ProviderInstanceId, ProviderSetupError, type ProviderAuthState } from "@t3tools/contracts";
+import {
+  ProviderInstanceId,
+  ProviderSetupError,
+  type ProviderAuthState,
+  type ProviderAuthInteraction,
+  type ProviderAuthResponse,
+} from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -60,6 +66,12 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
     readonly supportsLogout?: boolean;
     readonly beforeInitialize?: Effect.Effect<void>;
     readonly forwardCallback?: Effect.Effect<void, ProviderSetupError>;
+    readonly nativeLogin?: (
+      publish: (
+        interaction: ProviderAuthInteraction,
+        respond: (response: ProviderAuthResponse) => Effect.Effect<void, ProviderSetupError>,
+      ) => Effect.Effect<void, ProviderSetupError>,
+    ) => Effect.Effect<void, ProviderSetupError, Scope.Scope>;
   } = {},
 ) {
   const authenticated = yield* Deferred.make<void, AcpErrors.AcpError>();
@@ -74,6 +86,7 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
   let catalog = ["previous-account-model"];
   const auth = yield* makeAntigravityAuth({
     instanceId,
+    ...(options.nativeLogin ? { nativeLogin: options.nativeLogin } : {}),
     makeRuntime: (input) =>
       Effect.gen(function* () {
         receiveAuthorizationUrl = input.onAuthorizationUrl;
@@ -152,6 +165,45 @@ const makeHarness = Effect.fn("makeAuthTestHarness")(function* (
 });
 
 it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AntigravityAuth", (it) => {
+  it.effect("keeps native terminal login private and verifies ACP only after login exits", () =>
+    Effect.gen(function* () {
+      const loggedIn = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        nativeLogin: (publish) =>
+          Effect.gen(function* () {
+            yield* publish(
+              {
+                type: "terminal",
+                id: "google-login",
+                output: "Open Google and paste the return URL",
+              },
+              () => Deferred.succeed(loggedIn, undefined).pipe(Effect.asVoid),
+            );
+            yield* Deferred.await(loggedIn);
+          }),
+      });
+      const state = yield* harness.auth.controller.start(owner);
+      const waiting = yield* phase(harness.auth, "waiting");
+      assert.equal(waiting.interaction?.type, "terminal");
+      assert.deepEqual(harness.events, []);
+      const hidden = yield* harness.auth.controller.subscribe(otherOwner).pipe(Stream.runHead);
+      assert.isNull(Option.getOrThrow(hidden).interaction);
+      const response = {
+        instanceId,
+        flowId: state.flowId!,
+        interactionId: "google-login",
+        response: { type: "terminal" as const, data: "return-url\r" },
+      };
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(harness.auth.controller.respond!(otherOwner, response))),
+      );
+      yield* harness.auth.controller.respond!(owner, response);
+      yield* Deferred.await(harness.authenticateCalled);
+      yield* Deferred.succeed(harness.authenticated, undefined);
+      yield* Deferred.succeed(harness.discovered, undefined);
+      yield* phase(harness.auth, "succeeded");
+    }),
+  );
   it.effect("accepts a delayed duplicate after callback completion starts", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();

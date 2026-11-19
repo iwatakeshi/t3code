@@ -18,6 +18,13 @@ Antigravity setup.
 
 ### Sign in from a remote device
 
+With Antigravity CLI 1.5 and later, T3 opens a sign-in terminal in provider settings.
+Open the Google URL it prints in your browser, finish sign-in, then paste the
+returned code or full return URL into that terminal and press Enter. The remote
+environment completes sign-in and T3 checks access and loads models.
+
+Older runtimes use the return URL field instead:
+
 Google returns to a `127.0.0.1` address. It can finish directly when your browser is
 on the environment's machine. From another device, the final page will usually
 fail to load because the sign-in listener is on the environment.

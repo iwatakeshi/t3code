@@ -1,6 +1,8 @@
 import {
   ProviderSetupError,
   type ProviderAuthState,
+  type ProviderAuthInteraction,
+  type ProviderAuthResponse,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -54,6 +56,9 @@ interface AuthSnapshot {
 }
 
 interface AuthFlow {
+  respond?:
+    | ((response: ProviderAuthResponse) => Effect.Effect<void, ProviderSetupError>)
+    | undefined;
   readonly id: string;
   readonly ownerSessionId: string;
   readonly expiresAtMillis: number;
@@ -83,6 +88,13 @@ export type AntigravityAuthRuntime = Pick<
   "initialize" | "start" | "request"
 >;
 
+export type AntigravityNativeLogin = (
+  publish: (
+    interaction: ProviderAuthInteraction,
+    respond: (response: ProviderAuthResponse) => Effect.Effect<void, ProviderSetupError>,
+  ) => Effect.Effect<void, ProviderSetupError>,
+) => Effect.Effect<void, ProviderSetupError, Scope.Scope>;
+
 export interface AntigravityAuthOptions<
   Runtime extends AntigravityAuthRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"],
 > {
@@ -97,6 +109,7 @@ export interface AntigravityAuthOptions<
   readonly onSignedOut: Effect.Effect<void>;
   readonly forwardCallback?: (callback: URL) => Effect.Effect<void, ProviderSetupError>;
   readonly usesBrowser?: boolean;
+  readonly nativeLogin?: AntigravityNativeLogin;
 }
 
 function visibleSnapshot(snapshot: AuthSnapshot, ownerSessionId: string): ProviderAuthState {
@@ -239,6 +252,7 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
           ...flow.state,
           phase: Exit.isSuccess(result) ? "succeeded" : "failed",
           authorizationUrl: null,
+          interaction: null,
           expiresAt: null,
           message: Exit.isSuccess(result)
             ? usesBrowser
@@ -291,6 +305,21 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
   const runSignIn = Effect.fn("AntigravityAuth.runSignIn")(
     function* (flow: AuthFlow, stopSessions: Effect.Effect<void, ProviderSetupError>) {
       yield* stopSessions.pipe(Effect.ensuring(stopOwnedProcesses));
+      if (usesBrowser && options.nativeLogin) {
+        yield* Effect.scoped(
+          options.nativeLogin((interaction, respond) =>
+            lock.withPermits(1)(
+              Effect.gen(function* () {
+                if (activeFlow !== flow) return;
+                flow.respond = respond;
+                yield* publishFlow(flow, { ...flow.state, phase: "waiting", interaction });
+              }),
+            ),
+          ),
+        );
+        flow.respond = undefined;
+        yield* publishFlow(flow, { ...flow.state, phase: "starting", interaction: null });
+      }
       const runtime = yield* options.makeRuntime({
         onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url),
       });
@@ -349,6 +378,7 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
             yield* publishFlow(flow, {
               ...flow.state,
               phase,
+              interaction: null,
               authorizationUrl: null,
               expiresAt: null,
               message,
@@ -431,6 +461,18 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
           }),
         ),
       ),
+    respond: Effect.fn("AntigravityAuth.respond")(function* (ownerSessionId, input) {
+      return yield* lock.withPermits(1)(
+        Effect.gen(function* () {
+          const flow = yield* requireFlow(ownerSessionId, input.flowId, "respond");
+          if (!flow.respond || flow.state.interaction?.id !== input.interactionId) {
+            return yield* setupError("respond", "This sign-in interaction is no longer active.");
+          }
+          yield* flow.respond(input.response);
+          return flow.state;
+        }),
+      );
+    }),
     complete: Effect.fn("AntigravityAuth.complete")(function* (ownerSessionId, input) {
       const pending = yield* lock.withPermits(1)(
         Effect.gen(function* () {
@@ -576,7 +618,7 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
                     requiresConsent: false,
                     acceptsCallback: true,
                   }
-                : null,
+                : (state.interaction ?? null),
           };
         }),
         Stream.interruptWhen(Deferred.await(closed)),
