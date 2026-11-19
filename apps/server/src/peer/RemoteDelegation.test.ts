@@ -1273,13 +1273,42 @@ it.effect.each(["shared", "worktree"] as const)(
               ? { type: "worktree", baseRef: parentCommit, startFromOrigin: false }
               : { type: "root" },
         });
-        yield* Ref.set(thread.reply, "Queued review complete.");
+        const reply = isolation === "shared" ? "Queued review complete." : "x".repeat(16_001);
+        yield* Ref.set(thread.reply, reply);
         yield* Ref.set(thread.status, "completed");
         yield* Deferred.succeed(thread.finished, undefined);
         expect(yield* taskResult(restarted, taskId)).toMatchObject({
           status: "completed",
-          result: "Queued review complete.",
+          result: reply,
         });
+        const offered = yield* SubscriptionRef.changes(offers).pipe(
+          Stream.filter((seen) => seen.some((offer) => offer.threadId === parentThreadId)),
+          Stream.runHead,
+        );
+        const request = Option.getOrThrow(offered).find(
+          (offer) => offer.threadId === parentThreadId,
+        )!;
+        const delivery = request.delegatedCompletion!;
+        yield* restarted.orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`deliver:${taskId}`),
+          threadId: parentThreadId,
+          messageId: delivery.messageId,
+          text: "Delegated tasks reached terminal states.",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+          delegatedCompletion: { ...delivery, taskIds: [taskId] },
+        });
+        const completed = yield* restarted.orchestrator.getThreadProjection(parentThreadId);
+        const task = completed.subagents.find((task) => task.id === taskId)!;
+        const wake = completed.messages.find((message) => message.id === delivery.messageId);
+        expect(wake?.text).toContain("on Box");
+        expect(wake?.text).toContain(
+          `[result](t3-thread://v2/${box.environmentId}/${task.remoteChild!.threadId})`,
+        );
+        expect(wake?.text).toContain(isolation === "shared" ? reply : "Use task_status");
       }),
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

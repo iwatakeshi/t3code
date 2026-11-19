@@ -193,9 +193,16 @@ function delegatedCompletionNotification(
   tasks: ReadonlyArray<OrchestrationV2Subagent>,
 ): OrchestrationV2Notification {
   const taskIds = completion.taskIds;
-  const reports = taskIds.map((taskId) =>
-    delegatedTaskReport(tasks.find((task) => task.id === taskId)),
-  );
+  const reports = taskIds.map((taskId) => {
+    const task = tasks.find((task) => task.id === taskId);
+    return {
+      ...delegatedTaskReport(task),
+      worker:
+        task?.remoteChild === undefined
+          ? undefined
+          : (reportLabel(task.remoteChild.label) ?? task.remoteChild.environmentId),
+    };
+  });
   const delegatedByRun = tasks.filter(
     (task) => task.origin === "app_owned" && task.runId === completion.parentRunId,
   ).length;
@@ -211,10 +218,17 @@ function delegatedCompletionNotification(
         ...(only.childThreadId === undefined ? {} : { childThreadId: only.childThreadId }),
       },
       outcome,
-      summary: `Delegated task${label === undefined ? "" : ` "${label}"`} ${verb}`,
+      summary: `Delegated task${label === undefined ? "" : ` "${label}"`} ${verb}${only.worker === undefined ? "" : ` on ${only.worker}`}`,
     };
   }
-  const labels = reports.flatMap((report) => reportLabel(report.label) ?? []);
+  const labels = reports.flatMap((report) => {
+    const label = reportLabel(report.label);
+    return label === undefined
+      ? report.worker === undefined
+        ? []
+        : [`Task on ${report.worker}`]
+      : [`${label}${report.worker === undefined ? "" : ` on ${report.worker}`}`];
+  });
   const count =
     delegatedByRun > taskIds.length
       ? `${taskIds.length} of ${delegatedByRun}`

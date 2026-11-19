@@ -129,7 +129,8 @@ import {
   visibleConversationItems,
   visibleDeltaRunOrdinals,
 } from "./ContextHandoffService.ts";
-import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
+import { notificationTurnItem, reportLabel } from "@t3tools/provider-core/server/notification";
+import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import {
   cancelledBeforeStart,
   continuationFailedBeforePrompt,
@@ -941,7 +942,12 @@ function delegatedCompletionWakeDetail(
   return taskIds
     .map((taskId) => {
       const task = tasks.find((candidate) => candidate.id === taskId);
-      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}`;
+      const remote = task?.remoteChild;
+      const location =
+        remote === undefined
+          ? ""
+          : ` on ${reportLabel(remote.label) ?? remote.environmentId} (${formatThreadLink(remote, "result")})`;
+      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}${location}`;
       if (task?.result != null) {
         const detail = `${label}:\n${task.result}`;
         const bytes = Buffer.byteLength(detail);

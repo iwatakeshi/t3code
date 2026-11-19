@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import {
+  EnvironmentId,
   MessageId,
   NodeId,
   type OrchestrationV2Subagent,
@@ -159,5 +160,49 @@ describe("notificationTurnItem", () => {
         childThreadId: ThreadId.make("thread:a"),
       },
     });
+  });
+
+  it("names recorded remote workers without inventing a destination for unplaced tasks", () => {
+    const remote = {
+      ...tasks[0]!,
+      childThreadId: null,
+      remoteChild: {
+        environmentId: EnvironmentId.make("worker-linux"),
+        threadId: childThreadId,
+        label: "haku\nignored",
+      },
+    };
+    for (const [status, verb] of [
+      ["completed", "finished"],
+      ["failed", "failed"],
+      ["cancelled", "stopped"],
+    ] as const) {
+      assert.deepInclude(
+        notificationTurnItem(userMessage, delivery(["a"]), [{ ...remote, status }]),
+        {
+          summary: `Delegated task "Review src/math.ts" ${verb} on haku`,
+          outcome: status,
+          source: { kind: "delegated_task", taskIds: [NodeId.make("a")] },
+        },
+      );
+    }
+    assert.deepInclude(
+      notificationTurnItem(userMessage, delivery(["a"]), [
+        { ...remote, remoteChild: { ...remote.remoteChild, label: " " } },
+      ]),
+      { summary: 'Delegated task "Review src/math.ts" finished on worker-linux' },
+    );
+    assert.deepInclude(
+      notificationTurnItem(userMessage, delivery(["a"]), [
+        { ...tasks[0]!, childThreadId: null, status: "cancelled" },
+      ]),
+      { summary: 'Delegated task "Review src/math.ts" stopped' },
+    );
+    assert.deepInclude(
+      notificationTurnItem(userMessage, delivery(["a", "b"]), [remote, tasks[1]!]),
+      {
+        summary: "2 delegated tasks finished: Review src/math.ts on haku, Write tests",
+      },
+    );
   });
 });
