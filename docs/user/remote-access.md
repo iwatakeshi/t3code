@@ -427,11 +427,31 @@ destination reports `base_unavailable` before starting a thread. Older servers
 must be updated to support delegated worktrees. The reply includes `baseCommit`
 so the agent can identify the pinned revision. Uncommitted edits stay out.
 
+Set a worker's `maxDelegatedTasks` preference with
+`t3_environment_preferences_update` to limit accepted delegated work. `null`
+(the default) leaves it unlimited; `0` stops accepting additional branches.
+`t3_environment_resources` reports the limit and current usage. These preferences
+can target a linked environment too.
+
+A slot covers one unfinished delegated branch, including checkout preparation
+and queued work. A first local child reuses its parent's slot; additional local
+children need their own slots. A parent keeps its slot until it and its local
+children finish. Remote children use capacity on their own machine. Completion,
+failure and cancellation release capacity through saved task state, which also
+survives restarts. Ordinary user threads and provider-native subagents are outside
+this limit, so it is not a hard cap on processes or CPU use.
+
+A full worker refuses before accepting work. Auto then tries another eligible
+machine, without changing the pinned commit. If all are full, it returns
+`no_available_capacity` without queuing. Connection failures keep the destination
+pinned: the worker may already have accepted the task, so retry with the same key.
+
 Delegation does not copy files, fetch commits, or merge results. Without
 worktree isolation, tasks share the selected project's checkout. Auto cannot
 be combined with an explicit destination. If no machine qualifies, the call
 fails without starting or queuing work. Repeating the same `clientRequestId`
-keeps the original destination, OS requirements, isolation and worktree commit.
+preserves the OS requirements, isolation and worktree commit. Once a worker
+accepts, retries keep that destination.
 Changing the requirements or isolation on a retry returns a conflict; use a new
 key for a different task. A failed commit-availability check can be retried with
 the same key after transferring the pinned commit to the worker.

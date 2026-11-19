@@ -15671,8 +15671,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       } satisfies OrchestratorV2DispatchResult;
     }
     const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
+    const maxDelegatedTasks = (yield* serverSettings.getSettings.pipe(Effect.orDie))
+      .maxDelegatedTasks;
     const committed = yield* eventSink
       .commitCommand({
+        maxDelegatedTasks,
         commandId: command.commandId,
         threadId: commandThreadId(command),
         commandType: command.type,

@@ -1,3 +1,5 @@
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import { delegatedCapacityError } from "../orchestration-v2/DelegatedCapacity.ts";
 import {
   CommandId,
   type RunId,
@@ -248,6 +250,8 @@ function failure(code: OrchestratorMcpFailure["code"], message: string): Orchest
 }
 
 export function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
+  const capacity = delegatedCapacityError(error);
+  if (capacity !== undefined) return failure("no_available_capacity", capacity.message);
   if (!isThreadManagementError(error)) return failure("orchestration_error", errorMessage(error));
   switch (error._tag) {
     case "ThreadManagementThreadNotFoundError":
@@ -2263,6 +2267,253 @@ const make = Effect.gen(function* () {
     return task;
   });
 
+  const delegationRequests = yield* KeyedLock.make<string>();
+  const delegateTaskAttempt = Effect.fn("OrchestratorMcpService.delegateTaskAttempt")(function* (
+    callerScope: McpInvocationScope,
+    input: OrchestratorMcpDelegateTaskInput,
+    rejected: Set<McpInvocationScope["environmentId"]>,
+  ) {
+    const auto = input.placement === "auto";
+    yield* requireCapability(callerScope);
+    const delegationKey = yield* requestKey(input.clientRequestId);
+    input = { ...input, clientRequestId: delegationKey };
+    const workspaceParent =
+      input.isolation === "worktree"
+        ? (yield* loadThreadCaller(callerScope, "delegate_task")).parent.thread
+        : undefined;
+    const workspace = yield* delegationPlacement.pinWorkspace(
+      yield* requireThreadScope(callerScope, "delegate_task"),
+      { ...input, clientRequestId: delegationKey },
+      workspaceParent,
+    );
+    if (input.placement === "auto") {
+      const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
+      const providers = yield* loadProviders;
+      const resolved = yield* resolveTargetRechecking({
+        parent,
+        target: input.target,
+        providers,
+      }).pipe(
+        Effect.flatMap((target) =>
+          threadManagement
+            .isProviderInstanceEnabledForProject({
+              projectId: parent.thread.projectId,
+              instanceId: target.modelSelection.instanceId,
+            })
+            .pipe(
+              Effect.flatMap((enabled) =>
+                enabled
+                  ? resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode, target).pipe(
+                      Effect.as(target),
+                    )
+                  : Effect.undefined,
+              ),
+            ),
+        ),
+        Effect.orElseSucceed(() => undefined),
+      );
+      const clientRequestId = yield* requestKey(input.clientRequestId);
+      const target = yield* delegationPlacement.select(
+        scope,
+        { ...input, clientRequestId },
+        {
+          projectId: parent.thread.projectId,
+          modelSelection: parent.thread.modelSelection,
+          driverKind: providers.find(
+            (provider) => provider.instanceId === parent.thread.modelSelection.instanceId,
+          )?.driver,
+        },
+        resolved === undefined
+          ? undefined
+          : {
+              ...input.target,
+              providerInstanceId: resolved.modelSelection.instanceId,
+              model: resolved.modelSelection.model,
+            },
+        workspace,
+        rejected,
+      );
+      input = { ...input, placement: undefined, clientRequestId, target };
+    }
+    const requestedEnvironment = PeerForwarding.remoteTarget(
+      callerScope,
+      input.target?.environmentId,
+    );
+    if (
+      workspace !== undefined &&
+      requestedEnvironment !== undefined &&
+      input.target?.projectId === undefined
+    ) {
+      const projectId = yield* remoteDelegation.resolveProject(
+        yield* requireThreadScope(callerScope, "delegate_task"),
+        requestedEnvironment,
+        workspace.projectId,
+        undefined,
+      );
+      input = { ...input, target: { ...input.target, projectId } };
+    }
+    const execution = yield* delegationPlacement.check(
+      yield* requireThreadScope(callerScope, "delegate_task"),
+      { ...input, clientRequestId: delegationKey },
+      workspace,
+    );
+    const withEnvironment = (result: OrchestratorMcpDelegateTaskResult) => ({
+      ...result,
+      ...(execution === undefined ? {} : { environment: execution }),
+      ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
+    });
+    return yield* Effect.gen(function* () {
+      const environmentId =
+        input.target === undefined
+          ? undefined
+          : PeerForwarding.remoteTarget(callerScope, input.target.environmentId);
+      if (input.target !== undefined && environmentId !== undefined) {
+        yield* requireCapability(callerScope);
+        const scope = yield* requireThreadScope(callerScope, "delegate_task");
+        // The task's child runs as an ordinary thread there; this thread keeps the task.
+        const { taskId } = yield* remoteDelegation.delegate(scope, {
+          ...input,
+          target: { ...input.target, environmentId },
+          ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
+        });
+        return withEnvironment(
+          yield* input.mode === "wait"
+            ? awaitTask(scope, taskId, taskId, input.timeoutMs)
+            : readTask(scope, taskId, false, true),
+        );
+      }
+      const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
+      if (
+        input.target?.projectId !== undefined &&
+        input.target.projectId !== parent.thread.projectId
+      ) {
+        return yield* failure(
+          "invalid_request",
+          "A local task runs in this thread's project. Omit target.projectId, or pass target.environmentId to run it in that environment's project.",
+        );
+      }
+      const parentRun = parent.runs
+        .filter(ThreadManagementService.isActiveRun)
+        .toSorted((left, right) => right.ordinal - left.ordinal)[0];
+      if (
+        parentRun === undefined ||
+        parentRun.rootNodeId === null ||
+        parentRun.providerInstanceId !== scope.thread.providerInstanceId
+      ) {
+        return yield* failure(
+          "parent_not_active",
+          "Delegated tasks require an active run owned by this MCP provider session.",
+        );
+      }
+      const providers = yield* loadProviders;
+      const key = yield* requestKey(input.clientRequestId);
+      const commandId = stableCommandId({
+        scope,
+        requestKey: key,
+        operation: "delegate-task",
+      });
+      const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
+      const target = yield* resolveTargetRechecking({
+        parent,
+        target: input.target,
+        providers,
+        skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
+      });
+      const runtimeMode = yield* resolveRuntimeMode(
+        parent.thread.runtimeMode,
+        input.runtimeMode,
+        target,
+      );
+      const interactionMode = yield* resolveInteractionMode(
+        parent.thread.interactionMode,
+        input.interactionMode,
+      );
+      const workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined =
+        workspace === undefined
+          ? undefined
+          : { type: "worktree", baseRef: workspace.commitSha, startFromOrigin: false };
+      // ThreadManagementService.dispatch is the chokepoint for this command
+      // type's own enablement check, using the same command id and its
+      // receipt-replay exemption, so no separate assert runs here.
+      const result = yield* threadManagement
+        .dispatch({
+          type: "delegated_task.request",
+          createdBy: "agent",
+          creationSource: "mcp",
+          commandId,
+          parentThreadId: scope.thread.threadId,
+          parentRunId: parentRun.id,
+          parentNodeId: parentRun.rootNodeId,
+          task: taskPrompt(input),
+          ...(input.title === undefined ? {} : { title: input.title }),
+          modelSelection: target.modelSelection,
+          runtimeMode,
+          interactionMode,
+          ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
+          // Async delegations wake the parent on every child terminal; wait
+          // delegations deliver through the blocking tool call until `awaitTask`
+          // gives up the wait (timeout, cancelled call) and upgrades the wake.
+          completionWake: input.mode === "wait" ? "settled_only" : "always",
+        })
+        .pipe(
+          Effect.mapError((error) =>
+            delegatedCapacityError(error) !== undefined ||
+            error._tag === "ThreadManagementProviderInstanceDisabledError"
+              ? threadManagementFailure(error)
+              : failure(
+                  "orchestration_error",
+                  `Unable to create delegated task: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
+                ),
+          ),
+        );
+      const taskEvent = result.storedEvents.find(
+        (stored) =>
+          stored.event.type === "subagent.updated" && stored.event.payload.origin === "app_owned",
+      );
+      if (taskEvent?.event.type !== "subagent.updated") {
+        return yield* failure(
+          "orchestration_error",
+          "Delegated task command did not produce a task projection.",
+        );
+      }
+      const taskId = taskEvent.event.payload.id;
+      const childThreadId = taskEvent.event.payload.childThreadId;
+      const childRunEvent = result.storedEvents.find(
+        (stored) => stored.event.type === "run.created" && stored.event.threadId === childThreadId,
+      );
+      if (
+        childThreadId !== null &&
+        childRunEvent?.event.type === "run.created" &&
+        childRunEvent.event.payload.workspacePreparation !== undefined
+      ) {
+        yield* threadLaunch.prepareRun({
+          commandId,
+          threadId: childThreadId,
+          runId: childRunEvent.event.payload.id,
+        });
+      }
+
+      return withEnvironment(
+        yield* input.mode === "wait"
+          ? awaitTask(scope, taskId, key, input.timeoutMs)
+          : readTask(scope, taskId, false, true),
+      );
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.gen(function* () {
+          if (error.code === "no_available_capacity" && auto && execution !== undefined) {
+            yield* delegationPlacement.reject(
+              yield* requireThreadScope(callerScope, "delegate_task"),
+              { ...input, clientRequestId: delegationKey },
+            );
+            rejected.add(execution.environmentId);
+          }
+          return yield* error;
+        }),
+      ),
+    );
+  });
+
   return OrchestratorMcpService.of({
     scheduleTask: Effect.fn("OrchestratorMcpService.scheduleTask")(function* (scope, input) {
       const { parent, limits } = yield* loadCaller(scope, ["runs"]);
@@ -2676,227 +2927,20 @@ const make = Effect.gen(function* () {
         },
       };
     }),
-    delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
-      yield* requireCapability(callerScope);
-      const delegationKey = yield* requestKey(input.clientRequestId);
-      input = { ...input, clientRequestId: delegationKey };
-      const workspaceParent =
-        input.isolation === "worktree"
-          ? (yield* loadThreadCaller(callerScope, "delegate_task")).parent.thread
-          : undefined;
-      const workspace = yield* delegationPlacement.pinWorkspace(
-        yield* requireThreadScope(callerScope, "delegate_task"),
-        { ...input, clientRequestId: delegationKey },
-        workspaceParent,
-      );
-      if (input.placement === "auto") {
-        const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
-        const providers = yield* loadProviders;
-        const resolved = yield* resolveTargetRechecking({
-          parent,
-          target: input.target,
-          providers,
-        }).pipe(
-          Effect.flatMap((target) =>
-            threadManagement
-              .isProviderInstanceEnabledForProject({
-                projectId: parent.thread.projectId,
-                instanceId: target.modelSelection.instanceId,
-              })
-              .pipe(
-                Effect.flatMap((enabled) =>
-                  enabled
-                    ? resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode, target).pipe(
-                        Effect.as(target),
-                      )
-                    : Effect.undefined,
-                ),
-              ),
-          ),
-          Effect.orElseSucceed(() => undefined),
-        );
-        const clientRequestId = yield* requestKey(input.clientRequestId);
-        const target = yield* delegationPlacement.select(
-          scope,
-          { ...input, clientRequestId },
-          {
-            projectId: parent.thread.projectId,
-            modelSelection: parent.thread.modelSelection,
-            driverKind: providers.find(
-              (provider) => provider.instanceId === parent.thread.modelSelection.instanceId,
-            )?.driver,
-          },
-          resolved === undefined
-            ? undefined
-            : {
-                ...input.target,
-                providerInstanceId: resolved.modelSelection.instanceId,
-                model: resolved.modelSelection.model,
-              },
-          workspace,
-        );
-        input = { ...input, placement: undefined, clientRequestId, target };
-      }
-      const requestedEnvironment = PeerForwarding.remoteTarget(
-        callerScope,
-        input.target?.environmentId,
-      );
-      if (
-        workspace !== undefined &&
-        requestedEnvironment !== undefined &&
-        input.target?.projectId === undefined
-      ) {
-        const projectId = yield* remoteDelegation.resolveProject(
-          yield* requireThreadScope(callerScope, "delegate_task"),
-          requestedEnvironment,
-          workspace.projectId,
-          undefined,
-        );
-        input = { ...input, target: { ...input.target, projectId } };
-      }
-      const execution = yield* delegationPlacement.check(
-        yield* requireThreadScope(callerScope, "delegate_task"),
-        { ...input, clientRequestId: delegationKey },
-        workspace,
-      );
-      const withEnvironment = (result: OrchestratorMcpDelegateTaskResult) => ({
-        ...result,
-        ...(execution === undefined ? {} : { environment: execution }),
-        ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
-      });
-      const environmentId =
-        input.target === undefined
-          ? undefined
-          : PeerForwarding.remoteTarget(callerScope, input.target.environmentId);
-      if (input.target !== undefined && environmentId !== undefined) {
-        yield* requireCapability(callerScope);
-        const scope = yield* requireThreadScope(callerScope, "delegate_task");
-        // The task's child runs as an ordinary thread there; this thread keeps the task.
-        const { taskId } = yield* remoteDelegation.delegate(scope, {
-          ...input,
-          target: { ...input.target, environmentId },
-          ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
-        });
-        return withEnvironment(
-          yield* input.mode === "wait"
-            ? awaitTask(scope, taskId, taskId, input.timeoutMs)
-            : readTask(scope, taskId, false, true),
-        );
-      }
-      const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
-      if (
-        input.target?.projectId !== undefined &&
-        input.target.projectId !== parent.thread.projectId
-      ) {
-        return yield* failure(
-          "invalid_request",
-          "A local task runs in this thread's project. Omit target.projectId, or pass target.environmentId to run it in that environment's project.",
-        );
-      }
-      const parentRun = parent.runs
-        .filter(ThreadManagementService.isActiveRun)
-        .toSorted((left, right) => right.ordinal - left.ordinal)[0];
-      if (
-        parentRun === undefined ||
-        parentRun.rootNodeId === null ||
-        parentRun.providerInstanceId !== scope.thread.providerInstanceId
-      ) {
-        return yield* failure(
-          "parent_not_active",
-          "Delegated tasks require an active run owned by this MCP provider session.",
-        );
-      }
-      const providers = yield* loadProviders;
-      const key = yield* requestKey(input.clientRequestId);
-      const commandId = stableCommandId({
-        scope,
-        requestKey: key,
-        operation: "delegate-task",
-      });
-      const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
-      const target = yield* resolveTargetRechecking({
-        parent,
-        target: input.target,
-        providers,
-        skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
-      });
-      const runtimeMode = yield* resolveRuntimeMode(
-        parent.thread.runtimeMode,
-        input.runtimeMode,
-        target,
-      );
-      const interactionMode = yield* resolveInteractionMode(
-        parent.thread.interactionMode,
-        input.interactionMode,
-      );
-      const workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined =
-        workspace === undefined
-          ? undefined
-          : { type: "worktree", baseRef: workspace.commitSha, startFromOrigin: false };
-      // ThreadManagementService.dispatch is the chokepoint for this command
-      // type's own enablement check, using the same command id and its
-      // receipt-replay exemption, so no separate assert runs here.
-      const result = yield* threadManagement
-        .dispatch({
-          type: "delegated_task.request",
-          createdBy: "agent",
-          creationSource: "mcp",
-          commandId,
-          parentThreadId: scope.thread.threadId,
-          parentRunId: parentRun.id,
-          parentNodeId: parentRun.rootNodeId,
-          task: taskPrompt(input),
-          ...(input.title === undefined ? {} : { title: input.title }),
-          modelSelection: target.modelSelection,
-          runtimeMode,
-          interactionMode,
-          ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
-          // Async delegations wake the parent on every child terminal; wait
-          // delegations deliver through the blocking tool call until `awaitTask`
-          // gives up the wait (timeout, cancelled call) and upgrades the wake.
-          completionWake: input.mode === "wait" ? "settled_only" : "always",
-        })
-        .pipe(
-          Effect.mapError((error) =>
-            error._tag === "ThreadManagementProviderInstanceDisabledError"
-              ? threadManagementFailure(error)
-              : failure(
-                  "orchestration_error",
-                  `Unable to create delegated task: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
-                ),
-          ),
-        );
-      const taskEvent = result.storedEvents.find(
-        (stored) =>
-          stored.event.type === "subagent.updated" && stored.event.payload.origin === "app_owned",
-      );
-      if (taskEvent?.event.type !== "subagent.updated") {
-        return yield* failure(
-          "orchestration_error",
-          "Delegated task command did not produce a task projection.",
-        );
-      }
-      const taskId = taskEvent.event.payload.id;
-      const childThreadId = taskEvent.event.payload.childThreadId;
-      const childRunEvent = result.storedEvents.find(
-        (stored) => stored.event.type === "run.created" && stored.event.threadId === childThreadId,
-      );
-      if (
-        childThreadId !== null &&
-        childRunEvent?.event.type === "run.created" &&
-        childRunEvent.event.payload.workspacePreparation !== undefined
-      ) {
-        yield* threadLaunch.prepareRun({
-          commandId,
-          threadId: childThreadId,
-          runId: childRunEvent.event.payload.id,
-        });
-      }
-
-      return withEnvironment(
-        yield* input.mode === "wait"
-          ? awaitTask(scope, taskId, key, input.timeoutMs)
-          : readTask(scope, taskId, false, true),
+    delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (scope, request) {
+      const clientRequestId = yield* requestKey(request.clientRequestId);
+      const input = { ...request, clientRequestId };
+      return yield* delegationRequests.withLock(
+        `${encodeURIComponent(scope.requestNamespace)}:${encodeURIComponent(scope.thread?.threadId ?? "")}:${encodeURIComponent(clientRequestId)}`,
+        Effect.gen(function* () {
+          const rejected = new Set<McpInvocationScope["environmentId"]>();
+          while (true) {
+            const before = rejected.size;
+            const result = yield* delegateTaskAttempt(scope, input, rejected).pipe(Effect.result);
+            if (result._tag === "Success") return result.success;
+            if (rejected.size === before) return yield* result.failure;
+          }
+        }),
       );
     }),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {

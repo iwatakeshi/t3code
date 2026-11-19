@@ -221,6 +221,7 @@ it.effect("skips peers without capacity, access, repository, provider or resourc
     const cases = [
       { remote: { ...snapshot, cpuUtilization: 0.99 } },
       { remote: { ...snapshot, availableMemoryBytes: 100 } },
+      { remote: { ...snapshot, delegation: { limit: 1, used: 1 } } },
       { links: [{ ...link, access: "read-only" as const }] },
       { links: [{ ...link, status: "unreachable" as const }] },
       { providers: [{ ...provider, canRunChildTask: false }] },
@@ -541,4 +542,32 @@ it.effect(
         .pipe(Effect.flip);
       expect(changed.code).toBe("request_conflict");
     }),
+);
+
+it.effect("replaces only a refused destination while preserving the worktree commit", () =>
+  Effect.gen(function* () {
+    const { service, rebuild, state } = yield* setup;
+    const input = {
+      task: "Run checks",
+      placement: "auto" as const,
+      isolation: "worktree" as const,
+      clientRequestId: "refused",
+    };
+    const workspace = yield* service.pinWorkspace(scope, input, {
+      projectId: parent.projectId,
+      worktreePath: null,
+    });
+    const selected = yield* service.select(scope, input, parent, {}, workspace);
+    expect(selected.environmentId).toEqual(there);
+    yield* service.reject(scope, { ...input, target: selected });
+    yield* Ref.update(state, (s) => ({ ...s, head: "b".repeat(40) }));
+    const restarted = yield* rebuild;
+    const sameWorkspace = yield* restarted.pinWorkspace(scope, input, {
+      projectId: parent.projectId,
+      worktreePath: null,
+    });
+    expect(sameWorkspace).toEqual(workspace);
+    const fallback = yield* restarted.select(scope, input, parent, {}, workspace, new Set([there]));
+    expect(fallback.environmentId).toEqual(here);
+  }),
 );

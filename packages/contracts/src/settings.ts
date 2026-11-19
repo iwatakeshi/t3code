@@ -1363,7 +1363,12 @@ export const CloudSpeechCredentials = Schema.Struct({
   openrouter: CloudSpeechCredential,
 });
 
+export const DelegatedTaskLimit = Schema.NullOr(
+  Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+);
+
 export const ServerSettings = Schema.Struct({
+  maxDelegatedTasks: DelegatedTaskLimit.pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   // Null means unmigrated; empty is authoritative and must not resurrect cleared preferences.
   favorites: Schema.NullOr(ModelFavorites).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   providerModelPreferences: Schema.NullOr(ProviderModelPreferences).pipe(
@@ -1802,6 +1807,12 @@ const ModelSelectionPatch = Schema.Struct({
 });
 
 export const ServerSettingsPatch = Schema.Struct({
+  maxDelegatedTasks: Schema.optionalKey(
+    DelegatedTaskLimit.annotate({
+      description:
+        "Maximum unfinished delegated branches. null is unlimited; 0 stops admitting additional branches. A first local child reuses its parent slot.",
+    }),
+  ),
   setModelFavorites: Schema.optionalKey(
     Schema.Array(Schema.Struct({ ...ModelFavorite.fields, favorite: Schema.Boolean })),
   ),

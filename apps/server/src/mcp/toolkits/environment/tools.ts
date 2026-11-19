@@ -9,6 +9,7 @@ import {
   ServerSettingsPatch,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import { Tool, Toolkit } from "effect/ai";
 import * as ServerEnvironment from "../../../environment/ServerEnvironment.ts";
 import * as ThreadCommandExecutor from "../../../orchestration-v2/ThreadCommandExecutor.ts";
@@ -18,6 +19,7 @@ import * as HostResources from "../../../resourceTelemetry/HostResources.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const PreferenceFields = {
+  maxDelegatedTasks: ServerSettings.fields.maxDelegatedTasks,
   defaultThreadEnvMode: ServerSettings.fields.defaultThreadEnvMode,
   newWorktreesStartFromOrigin: ServerSettings.fields.newWorktreesStartFromOrigin,
   enableProviderUpdateChecks: ServerSettings.fields.enableProviderUpdateChecks,
@@ -61,6 +63,7 @@ const EnvironmentPreferencesTool = Tool.make("t3_environment_preferences_update"
     "Update environment-wide preferences. Live full-access or default caller thread only. Omitted fields are unchanged; `customInstructions: ''` clears it.",
   parameters: Schema.Struct({
     environmentId: OrchestratorMcpEnvironmentTarget,
+    maxDelegatedTasks: ServerSettingsPatch.fields.maxDelegatedTasks,
     defaultThreadEnvMode: ServerSettingsPatch.fields.defaultThreadEnvMode,
     newWorktreesStartFromOrigin: ServerSettingsPatch.fields.newWorktreesStartFromOrigin,
     enableProviderUpdateChecks: ServerSettingsPatch.fields.enableProviderUpdateChecks,
@@ -73,8 +76,13 @@ const EnvironmentResourcesTool = Tool.make("t3_environment_resources", {
   ...shared,
   description: "Read available CPU and memory on this machine, or a linked environment.",
   parameters: Schema.Struct({ environmentId: OrchestratorMcpEnvironmentTarget }),
-  success: HostResourcesSnapshot,
-  dependencies: [...shared.dependencies, HostResources.HostResources],
+  success: Schema.Struct({
+    ...HostResourcesSnapshot.fields,
+    delegation: Schema.optionalKey(
+      Schema.Struct({ limit: ServerSettings.fields.maxDelegatedTasks, used: Schema.Number }),
+    ),
+  }),
+  dependencies: [...shared.dependencies, HostResources.HostResources, SqlClient.SqlClient],
 })
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false);

@@ -14,6 +14,7 @@ import {
   type ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import { DelegatedCapacityError, usedDelegatedCapacity } from "./DelegatedCapacity.ts";
 import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -203,6 +204,7 @@ export interface EventSinkV2Shape {
     EventSinkV2Error
   >;
   readonly commitCommand: (input: {
+    readonly maxDelegatedTasks?: number | null;
     readonly commandId: CommandId;
     readonly threadId: ThreadId;
     readonly commandType: string;
@@ -281,6 +283,9 @@ const layerBase: Layer.Layer<
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const usedCapacity = usedDelegatedCapacity().pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+    );
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -781,9 +786,35 @@ const layerBase: Layer.Layer<
         return { receipt: existing.value, storedEvents };
       });
 
+    // A caller can catch refusal inside a provider batch; restore its deferred reads after rollback.
+    const withCapacitySavepoint = Effect.fn("EventSink.withCapacitySavepoint")(function* <A, E, R>(
+      work: Effect.Effect<A, E, R>,
+    ) {
+      const batch = yield* CurrentProviderBatch;
+      if (batch === undefined) return yield* work;
+      const nodeReads = new Map(batch.projection.nodeReads);
+      const threadTouches = new Map(batch.projection.threadTouches);
+      const projectedSequence = batch.projectedSequence;
+      return yield* sql.withTransaction(work).pipe(
+        Effect.onError(() =>
+          Effect.sync(() => {
+            batch.projection.nodeReads.clear();
+            for (const [key, value] of nodeReads) batch.projection.nodeReads.set(key, value);
+            batch.projection.threadTouches.clear();
+            for (const [key, value] of threadTouches)
+              batch.projection.threadTouches.set(key, value);
+            batch.projectedSequence = projectedSequence;
+          }),
+        ),
+      );
+    });
+
     const commitCommandEffect = Effect.fn("orchestrationV2.EventSink.commitCommand")(function* (
       input: Parameters<EventSinkV2Shape["commitCommand"]>[0],
     ) {
+      const checksCapacity =
+        input.maxDelegatedTasks != null &&
+        input.events.some((event) => event.type === "run.created" || event.type === "run.updated");
       const result = yield* commitThenPublish(
         [input.threadId, ...projectedThreadIds(input.events)],
         Effect.gen(function* () {
@@ -833,6 +864,7 @@ const layerBase: Layer.Layer<
             }
           }
 
+          const usedBefore = checksCapacity ? yield* usedCapacity : 0;
           const runId = input.updateDelegatedCompletionOnlyRunId;
           const normalized = yield* normalizeEvents(
             runId === undefined
@@ -855,6 +887,14 @@ const layerBase: Layer.Layer<
             );
           }
           const outcomes = yield* applyStoredEvents(storedEvents);
+          if (checksCapacity && input.maxDelegatedTasks != null) {
+            const used = yield* usedCapacity;
+            if (used > input.maxDelegatedTasks && used > usedBefore)
+              return yield* new DelegatedCapacityError({
+                limit: input.maxDelegatedTasks,
+                used: usedBefore,
+              });
+          }
           yield* effectOutbox.enqueue(input.effects);
           const receipt: CommandReceiptStore.CommandReceiptV2 = {
             commandId: input.commandId,
@@ -874,7 +914,7 @@ const layerBase: Layer.Layer<
                   ...input.cancelUnsettledEffects,
                 });
           return { receipt, storedEvents, outcomes, committed: true as const, cancelledEffectIds };
-        }),
+        }).pipe((work) => (checksCapacity ? withCapacitySavepoint(work) : work)),
         (result) =>
           Effect.gen(function* () {
             yield* effectOutbox.signalCancellations(result.cancelledEffectIds);

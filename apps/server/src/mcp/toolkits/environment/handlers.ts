@@ -1,3 +1,4 @@
+import { usedDelegatedCapacity } from "../../../orchestration-v2/DelegatedCapacity.ts";
 import { OrchestratorMcpFailure, type ServerSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Environment from "../../../environment/ServerEnvironment.ts";
@@ -11,6 +12,7 @@ import { EnvironmentToolkit } from "./tools.ts";
 
 export function preferences(settings: ServerSettings) {
   const {
+    maxDelegatedTasks,
     defaultThreadEnvMode,
     newWorktreesStartFromOrigin,
     enableProviderUpdateChecks,
@@ -19,6 +21,7 @@ export function preferences(settings: ServerSettings) {
   } = settings;
   const characters = Array.from(sourceControlWritingStyle.customInstructions);
   return {
+    maxDelegatedTasks,
     defaultThreadEnvMode,
     newWorktreesStartFromOrigin,
     enableProviderUpdateChecks,
@@ -43,7 +46,13 @@ const access = Effect.gen(function* () {
 });
 export const layer = McpToolAccess.toLayer(EnvironmentToolkit, {
   t3_environment_resources: McpToolAccess.reads(() =>
-    Effect.flatMap(HostResources.HostResources, (resources) => resources.read),
+    Effect.gen(function* () {
+      const resources = yield* HostResources.HostResources;
+      const settings = yield* Settings.ServerSettingsService;
+      const current = yield* settings.getSettings.pipe(Effect.mapError(unavailable));
+      const used = yield* usedDelegatedCapacity().pipe(Effect.mapError(unavailable));
+      return { ...(yield* resources.read), delegation: { limit: current.maxDelegatedTasks, used } };
+    }),
   ),
   t3_environment_read: McpToolAccess.reads(() =>
     Effect.gen(function* () {

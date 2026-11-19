@@ -1,3 +1,4 @@
+import { delegatedCapacityError } from "../../../orchestration-v2/DelegatedCapacity.ts";
 import {
   CommandId,
   MessageId,
@@ -374,6 +375,12 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           ...(input.delegatedFrom === undefined ? {} : { delegatedFrom: input.delegatedFrom }),
         }).pipe(
           Effect.mapError((error) => {
+            const capacity = delegatedCapacityError(error);
+            if (capacity !== undefined)
+              return new OrchestratorMcpFailure({
+                code: "no_available_capacity",
+                message: capacity.message,
+              });
             if (error._tag === "ThreadLaunchOsMismatchError")
               return new OrchestratorMcpFailure({
                 code: "no_compatible_environment",

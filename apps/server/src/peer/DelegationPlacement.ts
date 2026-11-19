@@ -64,6 +64,11 @@ export class DelegationPlacement extends Context.Service<
       | undefined,
       OrchestratorMcpFailure
     >;
+    /** Only after a definitive refusal, while holding the request lock across selection and launch. */
+    readonly reject: (
+      scope: Scope,
+      input: OrchestratorMcpDelegateTaskInput & { readonly clientRequestId: string },
+    ) => Effect.Effect<void, OrchestratorMcpFailure>;
     readonly select: (
       scope: Scope,
       input: OrchestratorMcpDelegateTaskInput & { readonly clientRequestId: string },
@@ -74,6 +79,7 @@ export class DelegationPlacement extends Context.Service<
       },
       localTarget: OrchestratorMcpTarget | undefined,
       workspace?: PinnedWorktree,
+      excluded?: ReadonlySet<Scope["environmentId"]>,
     ) => Effect.Effect<OrchestratorMcpTarget, OrchestratorMcpFailure>;
   }
 >()("t3/peer/DelegationPlacement") {}
@@ -327,7 +333,7 @@ const make = Effect.gen(function* () {
   );
 
   const select: DelegationPlacement["Service"]["select"] = Effect.fn("DelegationPlacement.select")(
-    function* (scope, input, parent, localTarget, workspace) {
+    function* (scope, input, parent, localTarget, workspace, excluded) {
       if (input.target?.environmentId !== undefined || input.target?.projectId !== undefined) {
         return yield* new OrchestratorMcpFailure({
           code: "invalid_request",
@@ -380,6 +386,7 @@ const make = Effect.gen(function* () {
               ).values(),
             ];
       const local =
+        excluded?.has(scope.environmentId) ||
         localTarget === undefined ||
         (workspace !== undefined &&
           !(yield* commitAvailable(
@@ -407,6 +414,7 @@ const make = Effect.gen(function* () {
       const remote = yield* Effect.forEach(
         linked.links.filter(
           (link) =>
+            !excluded?.has(link.environmentId) &&
             link.status === "reachable" &&
             link.access !== "read-only" &&
             (workspace === undefined || link.delegatedWorktrees === true) &&
@@ -500,7 +508,12 @@ const make = Effect.gen(function* () {
               },
               resources: snapshot,
               receivedAt: DateTime.toEpochMillis(yield* DateTime.now),
-              weight: 1,
+              weight:
+                snapshot.delegation != null &&
+                snapshot.delegation.limit !== null &&
+                snapshot.delegation.used >= snapshot.delegation.limit
+                  ? 0
+                  : 1,
             };
           }).pipe(
             Effect.timeout("5 seconds"),
@@ -516,11 +529,14 @@ const make = Effect.gen(function* () {
       const candidate = candidates.find((candidate) => candidate.environmentId === selected);
       if (candidate === undefined) {
         return yield* new OrchestratorMcpFailure({
-          code: candidates.length === 0 ? "no_compatible_environment" : "no_available_capacity",
+          code:
+            candidates.length === 0 && !excluded?.size
+              ? "no_compatible_environment"
+              : "no_available_capacity",
           message:
-            candidates.length === 0
+            candidates.length === 0 && !excluded?.size
               ? `No compatible machine has this repository, provider, model and execution requirements${input.requirements?.os === undefined ? "" : ` (${input.requirements.os.join(" or ")})`}${workspace === undefined ? "" : ` with commit ${workspace.commitSha}; transfer it to an eligible worker before retrying`}. Available operating systems: ${[localDescriptor.platform.os, ...linked.links.flatMap((link) => link.platform?.os ?? [])].join(", ")}. No task was started.`
-              : "Compatible machines have no available CPU or memory capacity. No task was started or queued.",
+              : "Compatible machines have no available task, CPU or memory capacity. No task was started or queued.",
         });
       }
       // Pin before launching: retries and concurrent calls must never start this request on two machines.
@@ -534,7 +550,20 @@ const make = Effect.gen(function* () {
       return pinned ?? candidate.target;
     },
   );
-  return DelegationPlacement.of({ select, check, pinWorkspace });
+  const reject: DelegationPlacement["Service"]["reject"] = Effect.fn("DelegationPlacement.reject")(
+    function* (scope, input) {
+      const target = yield* encodeTarget(input.target ?? {});
+      yield* sql`
+      UPDATE delegated_task_placements SET target_json = '{}'
+      WHERE request_namespace = ${scope.requestNamespace}
+        AND parent_thread_id = ${scope.thread.threadId}
+        AND client_request_id = ${input.clientRequestId}
+        AND target_json = ${target}
+    `;
+    },
+    Effect.mapError(placementFailure),
+  );
+  return DelegationPlacement.of({ select, check, pinWorkspace, reject });
 });
 
 export const layer = Layer.effect(DelegationPlacement, make);

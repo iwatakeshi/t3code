@@ -1,3 +1,4 @@
+import { DelegatedCapacityError } from "../orchestration-v2/DelegatedCapacity.ts";
 import * as DocumentText from "../provider/DocumentText.ts";
 import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -5,6 +6,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
   EventId,
+  EnvironmentId,
   MessageId,
   type ModelSelection,
   NodeId,
@@ -95,6 +97,8 @@ type LaunchedWith = Pick<
 
 /** The thread the box launches for the task, which the test finishes. */
 interface BoxThread {
+  readonly admits: Ref.Ref<boolean>;
+  readonly launches: Ref.Ref<number>;
   readonly hasCommit: Ref.Ref<boolean>;
   readonly launched: Ref.Ref<ThreadId | null>;
   /** The link session that launched it, as the box stamps it. */
@@ -152,6 +156,8 @@ interface BoxThread {
 
 const makeBoxThread = Effect.gen(function* () {
   return {
+    admits: yield* Ref.make(true),
+    launches: yield* Ref.make(0),
     hasCommit: yield* Ref.make(true),
     launched: yield* Ref.make<ThreadId | null>(null),
     linkOrigin: yield* Ref.make<{ readonly sessionId: string; readonly label: string } | null>(
@@ -223,8 +229,8 @@ const boxProjects: ReadonlyArray<Project> = [
   },
 ];
 
-const serveBox = (thread: BoxThread) => {
-  return servePeer(box, boxToolkitLayer(thread));
+const serveBox = (thread: BoxThread, descriptor = box) => {
+  return servePeer(descriptor, boxToolkitLayer(thread));
 };
 
 const boxRunId = RunId.make("run:box");
@@ -517,47 +523,58 @@ const boxToolkitLayer = (thread: BoxThread) => {
         Effect.flatMap((matches) => (matches ? Ref.get(thread.hasCommit) : Effect.succeed(false))),
       ),
     launch: (input) =>
-      Ref.get(thread.runless).pipe(
-        Effect.flatMap((runless) =>
-          Ref.set(thread.launched, input.threadId!).pipe(
-            Effect.andThen(Ref.set(thread.linkOrigin, input.linkOrigin ?? null)),
-            Effect.andThen(Ref.set(thread.delegatedFrom, input.delegatedFrom ?? null)),
-            Effect.andThen(Ref.set(thread.message, input.initialMessage?.text ?? null)),
-            Effect.andThen(
-              Ref.set(thread.launchedWith, {
-                modelSelection: input.modelSelection,
-                runtimeMode: input.runtimeMode,
-                interactionMode: input.interactionMode,
-                ...(input.requirements === undefined ? {} : { requirements: input.requirements }),
-                workspaceStrategy: input.workspaceStrategy,
-              }),
-            ),
-            Effect.andThen(Effect.flatten(Ref.get(thread.afterLaunch))),
-            Effect.as({
-              threadId: input.threadId,
-              projection: {
-                thread: {
-                  id: input.threadId,
-                  projectId: input.projectId,
-                  title: input.title,
+      Effect.gen(function* () {
+        if ((yield* Ref.get(thread.launched)) !== input.threadId)
+          yield* Ref.update(thread.launches, (count) => count + 1);
+        if (!(yield* Ref.get(thread.admits)))
+          return yield* new ThreadLaunch.ThreadLaunchError({
+            commandId: input.commandId,
+            projectId: input.projectId,
+            operation: "create-thread",
+            cause: new DelegatedCapacityError({ limit: 1, used: 1 }),
+          });
+        return yield* Ref.get(thread.runless).pipe(
+          Effect.flatMap((runless) =>
+            Ref.set(thread.launched, input.threadId!).pipe(
+              Effect.andThen(Ref.set(thread.linkOrigin, input.linkOrigin ?? null)),
+              Effect.andThen(Ref.set(thread.delegatedFrom, input.delegatedFrom ?? null)),
+              Effect.andThen(Ref.set(thread.message, input.initialMessage?.text ?? null)),
+              Effect.andThen(
+                Ref.set(thread.launchedWith, {
                   modelSelection: input.modelSelection,
+                  runtimeMode: input.runtimeMode,
+                  interactionMode: input.interactionMode,
+                  ...(input.requirements === undefined ? {} : { requirements: input.requirements }),
+                  workspaceStrategy: input.workspaceStrategy,
+                }),
+              ),
+              Effect.andThen(Effect.flatten(Ref.get(thread.afterLaunch))),
+              Effect.as({
+                threadId: input.threadId,
+                projection: {
+                  thread: {
+                    id: input.threadId,
+                    projectId: input.projectId,
+                    title: input.title,
+                    modelSelection: input.modelSelection,
+                  },
+                  runs:
+                    input.initialMessage?.messageId && !runless
+                      ? [
+                          {
+                            id: runId,
+                            status: "running",
+                            userMessageId: input.initialMessage.messageId,
+                          },
+                        ]
+                      : [],
                 },
-                runs:
-                  input.initialMessage?.messageId && !runless
-                    ? [
-                        {
-                          id: runId,
-                          status: "running",
-                          userMessageId: input.initialMessage.messageId,
-                        },
-                      ]
-                    : [],
-              },
-              resumed: false,
-            } as unknown as ThreadLaunch.ThreadLaunchResult),
+                resumed: false,
+              } as unknown as ThreadLaunch.ThreadLaunchResult),
+            ),
           ),
-        ),
-      ),
+        );
+      }),
   });
   return Layer.mergeAll(
     McpHttpServer.layerOrchestratorToolkit,
@@ -569,13 +586,15 @@ const boxToolkitLayer = (thread: BoxThread) => {
       Layer.merge(
         NodeCrypto.layer,
         Layer.mock(HostResources.HostResources)({
-          read: Effect.succeed({
-            sampledAt: 0,
-            cpuUtilization: 0.1,
-            cpuCount: 8,
-            totalMemoryBytes: 16_000,
-            availableMemoryBytes: 12_000,
-          }),
+          read: Ref.get(thread.admits).pipe(
+            Effect.map((admits) => ({
+              sampledAt: 0,
+              cpuUtilization: admits ? 0.1 : 0.01,
+              cpuCount: 8,
+              totalMemoryBytes: 16_000,
+              availableMemoryBytes: 12_000,
+            })),
+          ),
         }),
       ),
     ),
@@ -633,7 +652,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
         providerInstances: { [boxClaude.instanceId]: { driver: boxClaude.driver, enabled: true } },
       }),
     ),
-    Layer.provide(NodeServices.layer),
+    Layer.provide(Layer.merge(NodeServices.layer, SqlitePersistence.layerMemory)),
   );
 };
 
@@ -1020,6 +1039,17 @@ it.effect.each(["shared", "worktree"] as const)(
             },
           ],
         });
+        yield* Ref.set(thread.admits, false);
+        const full = yield* a.call("delegate_task", input);
+        expect(full.isError).toBe(true);
+        expect(full.content).toMatchObject([
+          { text: expect.stringContaining("no_available_capacity") },
+        ]);
+        expect(yield* Ref.get(thread.launched)).toBeNull();
+        expect((yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents).toHaveLength(
+          0,
+        );
+        yield* Ref.set(thread.admits, true);
         const result = yield* a.call("delegate_task", input);
         expect(result.isError, JSON.stringify(result.content)).toBe(false);
         const delegated = result.structuredContent as {
@@ -1060,6 +1090,52 @@ it.effect.each(["shared", "worktree"] as const)(
         });
       }),
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("Auto retries another worker only after an authoritative capacity refusal", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const full = yield* makeBoxThread;
+      yield* Ref.set(full.admits, false);
+      const idle = yield* makeBoxThread;
+      const b = yield* serveBox(full);
+      const other = { ...box, environmentId: EnvironmentId.make("environment-other-box") };
+      const c = yield* Layer.build(Layer.fresh(NodeHttpServer.layerTest)).pipe(
+        Effect.flatMap((server) => serveBox(idle, other).pipe(Effect.provideContext(server))),
+      );
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const a = yield* makeLaptop(database, offers);
+      yield* linkTo(a.links, b, "full-access");
+      yield* linkTo(a.links, c, "full-access");
+      yield* seedParent(a);
+      const input = {
+        task: "Review on available compute",
+        placement: "auto",
+        isolation: "worktree",
+        target: { driverKind: boxClaude.driver, model: "claude-sonnet-4-6" },
+        clientRequestId: "capacity-fallback",
+      };
+      const results = yield* Effect.forEach([0, 1], () => a.call("delegate_task", input), {
+        concurrency: "unbounded",
+      });
+      for (const result of results) {
+        expect(result.isError, JSON.stringify(result.content)).toBe(false);
+        expect(result.structuredContent).toMatchObject({
+          remoteChild: { environmentId: other.environmentId },
+          baseCommit: parentCommit,
+        });
+      }
+      expect(results[0]?.structuredContent).toEqual(results[1]?.structuredContent);
+      expect(yield* Ref.get(full.launches)).toEqual(1);
+      expect(yield* Ref.get(full.launched)).toBeNull();
+      expect(yield* Ref.get(idle.launches)).toEqual(1);
+      yield* Ref.set(idle.status, "completed");
+      yield* Deferred.succeed(idle.finished, undefined);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect("a task delegated to the box wakes the laptop's parent when it ends there", () =>
