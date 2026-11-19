@@ -21,7 +21,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as Tool from "effect/ai/Tool";
 
-import { runtimeModeRank } from "../mcp/delegatedTaskModes.ts";
+import { runtimeModeRank, interactionModeRank } from "../mcp/delegatedTaskModes.ts";
 import { assertNotLinked } from "../mcp/linkOrigin.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import { readCaller, unavailable } from "../mcp/threadAccess.ts";
@@ -41,6 +41,11 @@ type Scope = McpInvocationContext.McpInvocationScope;
  * the call to the link's access, narrowed to the agent's modes, which every
  * forwarded call carries.
  */
+export const ForwardedModeCeiling = Context.Reference<McpInvocationContext.ClientModes | undefined>(
+  "t3/peer/ForwardedModeCeiling",
+  { defaultValue: () => undefined },
+);
+
 export class PeerForwarding extends Context.Service<
   PeerForwarding,
   {
@@ -156,7 +161,22 @@ const make = Effect.gen(function* () {
     environmentId: EnvironmentId,
     params: unknown,
   ) {
-    const { caller, limits } = yield* forwardingCaller(scope);
+    const { caller, limits: current } = yield* forwardingCaller(scope);
+    const ceiling = yield* ForwardedModeCeiling;
+    const limits =
+      ceiling === undefined
+        ? current
+        : {
+            runtimeMode:
+              runtimeModeRank(current.runtimeMode) <= runtimeModeRank(ceiling.runtimeMode)
+                ? current.runtimeMode
+                : ceiling.runtimeMode,
+            interactionMode:
+              interactionModeRank(current.interactionMode) <=
+              interactionModeRank(ceiling.interactionMode)
+                ? current.interactionMode
+                : ceiling.interactionMode,
+          };
     const encoded = (yield* Schema.encodeUnknownEffect(parameters as Schema.Encoder<unknown>)(
       params,
     ).pipe(Effect.mapError(unavailable))) as Record<string, unknown>;

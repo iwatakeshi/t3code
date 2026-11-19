@@ -849,6 +849,7 @@ it("readThread and sendToThread reach threads in other projects", async () => {
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ThreadManagementService.ThreadManagementService)({
+          hasReceipt: () => Effect.succeed(false),
           getThreadRecords: (threadId) => {
             if (threadId === parentThreadId) return Effect.succeed(parentProjection);
             if (threadId === foreignThreadId) return Effect.succeed(foreignProjection(threadId));

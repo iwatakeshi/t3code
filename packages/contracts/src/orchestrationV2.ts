@@ -1,3 +1,4 @@
+import { GitCommitSha } from "./git.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import { withRecordIdTable } from "./orchestrationV2IdTable.ts";
 import * as DateTime from "effect/DateTime";
@@ -925,6 +926,23 @@ export const OrchestrationV2RemoteTaskChild = Schema.Struct({
 });
 export type OrchestrationV2RemoteTaskChild = typeof OrchestrationV2RemoteTaskChild.Type;
 
+export const OrchestrationV2QueuedPlacement = Schema.Struct({
+  requestNamespace: Schema.String,
+  providerSessionId: Schema.String,
+  providerInstanceId: ProviderInstanceId,
+  environmentId: EnvironmentId,
+  commandId: CommandId,
+  requestJson: Schema.String,
+  baseCommit: Schema.optional(GitCommitSha),
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  linkGeneration: Schema.optional(Schema.String),
+  failure: Schema.optional(Schema.String),
+  phase: Schema.Literals(["queued", "dispatching"]),
+  cancelRequested: Schema.optional(Schema.Boolean),
+});
+export type OrchestrationV2QueuedPlacement = typeof OrchestrationV2QueuedPlacement.Type;
+
 export const OrchestrationV2Subagent = Schema.Struct({
   id: NodeId,
   threadId: ThreadId,
@@ -937,6 +955,7 @@ export const OrchestrationV2Subagent = Schema.Struct({
   providerThreadId: Schema.NullOr(ProviderThreadId),
   childThreadId: Schema.NullOr(ThreadId),
   remoteChild: Schema.optional(OrchestrationV2RemoteTaskChild),
+  queuedPlacement: Schema.optional(OrchestrationV2QueuedPlacement),
   nativeTaskRef: Schema.NullOr(OrchestrationV2ProviderRef),
   prompt: Schema.String,
   title: Schema.NullOr(Schema.String),
@@ -3557,6 +3576,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("delegated_task.request"),
+    queuedTaskId: Schema.optional(NodeId),
     ...OrchestrationV2CreationFields,
     commandId: CommandId,
     parentThreadId: ThreadId,
@@ -3700,7 +3720,30 @@ const OrchestrationV2InternalCommand = Schema.Union([
    * there. The ids derive from `commandId`, so a retry records nothing new.
    */
   Schema.Struct({
+    type: Schema.Literal("delegated_task.queue"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    parentRunId: RunId,
+    parentNodeId: NodeId,
+    task: TrimmedNonEmptyString,
+    title: Schema.optional(TrimmedNonEmptyString),
+    driver: ProviderDriverKind,
+    modelSelection: ModelSelection,
+    queuedPlacement: OrchestrationV2QueuedPlacement,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("delegated_task.placement.update"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
+    linkGeneration: Schema.optional(Schema.String),
+    failure: Schema.optional(Schema.String),
+    phase: Schema.optional(Schema.Literals(["queued", "dispatching"])),
+    cancelRequested: Schema.optional(Schema.Boolean),
+  }),
+  Schema.Struct({
     type: Schema.Literal("delegated_task.remote.request"),
+    queuedTaskId: Schema.optional(NodeId),
     commandId: CommandId,
     parentThreadId: ThreadId,
     parentRunId: RunId,

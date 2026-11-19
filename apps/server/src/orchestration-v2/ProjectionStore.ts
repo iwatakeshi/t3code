@@ -665,6 +665,10 @@ export interface ProjectionStoreV2Shape {
    * result yet, or cancelled or stopped here without that stop reaching there,
    * including a Stop after the task had its result.
    */
+  readonly getQueuedDelegations: Effect.Effect<
+    ReadonlyArray<OrchestrationV2Subagent>,
+    ProjectionStoreV2Error
+  >;
   readonly getOpenRemoteDelegatedTasks: Effect.Effect<
     ReadonlyArray<{ readonly parentThreadId: ThreadId; readonly taskId: NodeId }>,
     ProjectionStoreV2Error
@@ -8572,6 +8576,23 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         )
         .pipe(Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })));
 
+    const getQueuedDelegations = sql<{ readonly payload_json: string }>`
+      SELECT s.payload_json FROM orchestration_v2_projection_subagents s
+      JOIN orchestration_v2_projection_threads t ON t.thread_id = s.thread_id
+      WHERE s.status IN ('pending', 'cancelled', 'interrupted') AND json_type(s.payload_json, '$.queuedPlacement') = 'object'
+        AND (s.status = 'pending' OR json_extract(s.payload_json, '$.queuedPlacement.phase') = 'dispatching')
+        AND t.deleted_at IS NULL
+      ORDER BY s.started_at, s.subagent_id
+    `.pipe(
+      Effect.flatMap((rows) =>
+        Effect.forEach(rows, (row) => decodeSubagentPayload(row.payload_json)),
+      ),
+      Effect.mapError(
+        (cause) =>
+          new ProjectionStoreReadError({ threadId: ThreadId.make("queued-delegations"), cause }),
+      ),
+    );
+
     const getOpenRemoteDelegatedTasks: ProjectionStoreV2Shape["getOpenRemoteDelegatedTasks"] = sql<{
       readonly thread_id: string;
       readonly subagent_id: string;
@@ -9469,6 +9490,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThreadTitles: readOnReader(getThreadTitles),
       getThreadLinkMetadata: readOnReader(getThreadLinkMetadata),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
+      getQueuedDelegations: getQueuedDelegations.pipe(NodeSqliteClient.readOnly),
       getOpenRemoteDelegatedTasks: getOpenRemoteDelegatedTasks.pipe(NodeSqliteClient.readOnly),
       getThreadProjection: readOnReader(getThreadProjection),
       getTurnStartContext: readOnReader(getTurnStartContext),

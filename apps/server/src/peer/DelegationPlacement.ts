@@ -1,3 +1,4 @@
+import { usedDelegatedCapacity } from "../orchestration-v2/DelegatedCapacity.ts";
 import {
   type ModelSelection,
   type ExecutionEnvironmentPlatform,
@@ -46,6 +47,10 @@ const CapabilitiesTool = Tool.make("orchestrator_capabilities", {
 export class DelegationPlacement extends Context.Service<
   DelegationPlacement,
   {
+    readonly availability: (
+      scope: Scope,
+      limit: number | null,
+    ) => Effect.Effect<string, OrchestratorMcpFailure>;
     readonly pinWorkspace: (
       scope: Scope,
       input: OrchestratorMcpDelegateTaskInput & { readonly clientRequestId: string },
@@ -563,7 +568,52 @@ const make = Effect.gen(function* () {
     },
     Effect.mapError(placementFailure),
   );
-  return DelegationPlacement.of({ select, check, pinWorkspace, reject });
+  const encodeAvailability = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+  const availability: DelegationPlacement["Service"]["availability"] = Effect.fn(
+    "DelegationPlacement.availability",
+  )(function* (scope, limit) {
+    const state = (snapshot: import("@t3tools/contracts").HostResourcesSnapshot) => [
+      snapshot.cpuUtilization !== null && snapshot.cpuUtilization < 0.95,
+      snapshot.totalMemoryBytes > 0 &&
+        snapshot.availableMemoryBytes / snapshot.totalMemoryBytes > 0.05,
+    ];
+    const local = yield* resources.read;
+    const used = yield* usedDelegatedCapacity().pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.mapError(placementFailure),
+    );
+    const links = yield* forwarding.links(scope);
+    const remote = yield* Effect.forEach(
+      links.links,
+      (link) =>
+        Effect.gen(function* () {
+          if (link.status !== "reachable" || link.access === "read-only")
+            return [link.environmentId, link.status, link.access];
+          const snapshot = yield* forwarding
+            .call(scope, EnvironmentToolkit.tools.t3_environment_resources, link.environmentId, {})
+            .pipe(
+              Effect.timeout("5 seconds"),
+              Effect.orElseSucceed(() => undefined),
+            );
+          return [
+            link.environmentId,
+            link.access,
+            snapshot === undefined
+              ? null
+              : [
+                  ...state(snapshot),
+                  snapshot.delegation?.limit ?? null,
+                  snapshot.delegation?.used ?? null,
+                ],
+          ];
+        }),
+      { concurrency: 4 },
+    );
+    return yield* encodeAvailability([[...state(local), limit, used], remote]).pipe(
+      Effect.mapError(placementFailure),
+    );
+  });
+  return DelegationPlacement.of({ select, check, pinWorkspace, reject, availability });
 });
 
 export const layer = Layer.effect(DelegationPlacement, make);

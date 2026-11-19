@@ -1,3 +1,4 @@
+import * as OrchestratorMcpService from "./mcp/OrchestratorMcpService.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
 import * as Random from "effect/Random";
@@ -862,6 +863,14 @@ const layerMakeRoutes = Layer.mergeAll(
   McpHttpServer.layer.pipe(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
+  ),
+  Layer.effectDiscard(
+    OrchestratorMcpService.OrchestratorMcpService.pipe(
+      Effect.flatMap((service) => service.startQueuedDelegations()),
+    ),
+  ).pipe(
+    Layer.provide(OrchestratorMcpService.layer),
+    Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
   ),
   // Follows delegated tasks running in linked environments, including after a restart.
   Layer.effectDiscard(

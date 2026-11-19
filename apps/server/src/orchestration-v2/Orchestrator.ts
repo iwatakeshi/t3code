@@ -392,6 +392,7 @@ export interface OrchestratorV2DispatchResult {
 }
 
 export interface OrchestratorV2Shape {
+  readonly getQueuedDelegations: ProjectionStoreV2["Service"]["getQueuedDelegations"];
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   readonly recoverDelegatedTasks: Effect.Effect<void>;
   readonly recoverDelegatedTask: (
@@ -687,6 +688,8 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "provider.switch":
       return command.threadId;
     case "delegated_task.request":
+    case "delegated_task.queue":
+    case "delegated_task.placement.update":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
     case "delegated_task.remote.stop":
@@ -9479,10 +9482,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             (cause) => new OrchestratorProjectionError({ threadId: command.parentThreadId, cause }),
           ),
         );
+      const queued =
+        command.queuedTaskId === undefined
+          ? undefined
+          : (yield* projectionStore
+              .getThreadRecords(command.parentThreadId, ["subagents"], {
+                subagentIds: [command.queuedTaskId],
+              })
+              .pipe(mapDispatchError(command))).subagents[0];
+      if (
+        command.queuedTaskId !== undefined &&
+        (queued?.queuedPlacement === undefined ||
+          queued.status !== "pending" ||
+          queued.queuedPlacement.cancelRequested === true ||
+          queued.runId !== command.parentRunId ||
+          queued.queuedPlacement.commandId !== command.commandId)
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Queued delegation is no longer eligible to start.",
+        });
       const parentRun = parentProjection.runs.find(
         (candidate) => candidate.id === command.parentRunId,
       );
-      if (parentRun === undefined || !isActiveRun(parentRun)) {
+      if (
+        parentRun === undefined ||
+        (!isActiveRun(parentRun) && !(queued !== undefined && parentRun.status === "completed"))
+      ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
@@ -9935,7 +9962,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   )(function* (
     command: Extract<
       OrchestrationV2InternalCommand,
-      { readonly type: "delegated_task.remote.request" }
+      { readonly type: "delegated_task.remote.request" | "delegated_task.queue" }
     >,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
   ) {
@@ -9946,6 +9973,36 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           (cause) => new OrchestratorProjectionError({ threadId: command.parentThreadId, cause }),
         ),
       );
+    const isQueue = command.type === "delegated_task.queue";
+    const queued =
+      command.type === "delegated_task.remote.request" && command.queuedTaskId !== undefined
+        ? parentProjection.subagents.find((task) => task.id === command.queuedTaskId)
+        : undefined;
+    if (
+      command.type === "delegated_task.remote.request" &&
+      command.queuedTaskId !== undefined &&
+      (queued?.queuedPlacement === undefined ||
+        queued.runId !== command.parentRunId ||
+        queued.childThreadId !== null ||
+        queued.remoteChild !== undefined)
+    )
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Queued delegation is no longer eligible to attach.",
+      });
+    const cancelled =
+      (queued !== undefined && queued.status !== "pending") ||
+      queued?.queuedPlacement?.cancelRequested === true;
+    const status = isQueue
+      ? ("pending" as const)
+      : cancelled
+        ? ("cancelled" as const)
+        : ("running" as const);
+    const remoteChild =
+      command.type === "delegated_task.remote.request"
+        ? { ...command.remoteChild, ...(cancelled ? { stoppedThere: false } : {}) }
+        : undefined;
     const parentRun = parentProjection.runs.find(
       (candidate) => candidate.id === command.parentRunId,
     );
@@ -9953,14 +10010,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const followsUp = parentProjection.subagents.some(
       (task) =>
         task.result !== null &&
-        task.remoteChild?.environmentId === command.remoteChild.environmentId &&
-        task.remoteChild.threadId === command.remoteChild.threadId,
+        remoteChild !== undefined &&
+        task.remoteChild?.environmentId === remoteChild.environmentId &&
+        task.remoteChild.threadId === remoteChild.threadId,
     );
     if (
       parentRun === undefined ||
       (followsUp
         ? parentRun.id !== followUpOwnerRun(parentProjection.runs)?.id
-        : !isActiveRun(parentRun)) ||
+        : !isActiveRun(parentRun) &&
+          !(queued !== undefined && (parentRun.status === "completed" || cancelled))) ||
       parentRun.rootNodeId === null
     ) {
       return yield* new OrchestratorDispatchError({
@@ -9969,7 +10028,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Parent run ${command.parentRunId} is not active.`,
       });
     }
-    if (yield* stopReachedRun(command, command.parentThreadId, parentRun.id)) {
+    if (!cancelled && (yield* stopReachedRun(command, command.parentThreadId, parentRun.id))) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
@@ -9977,9 +10036,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     const now = yield* DateTime.now;
-    const taskNodeId = idAllocator.derive.delegatedTaskNode({ commandId: command.commandId });
+    const taskCommandId =
+      command.type === "delegated_task.queue"
+        ? command.queuedPlacement.commandId
+        : (queued?.queuedPlacement?.commandId ?? command.commandId);
+    const taskNodeId =
+      queued?.id ?? idAllocator.derive.delegatedTaskNode({ commandId: taskCommandId });
     const taskTurnItemId = idAllocator.derive.delegatedTaskTurnItem({
-      commandId: command.commandId,
+      commandId: taskCommandId,
     });
     const taskTitle = subagentThreadTitle({
       parentTitle: parentProjection.thread.title,
@@ -10006,7 +10070,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         parentNodeId: command.parentNodeId,
         rootNodeId: parentRun.rootNodeId,
         kind: "subagent",
-        status: "running",
+        status,
         countsForRun: false,
         providerThreadId: null,
         providerTurnId: null,
@@ -10031,15 +10095,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerInstanceId: command.modelSelection.instanceId,
         providerThreadId: null,
         childThreadId: null,
-        remoteChild: command.remoteChild,
+        ...(remoteChild === undefined ? {} : { remoteChild }),
         nativeTaskRef: null,
         prompt: command.task,
         title: command.title ?? null,
         model: command.modelSelection.model,
         modelSelection: command.modelSelection,
-        ...(command.completionWake === undefined ? {} : { completionWake: command.completionWake }),
-        status: "running",
-        result: null,
+        ...(command.type === "delegated_task.queue"
+          ? { completionWake: "always" as const }
+          : command.completionWake === undefined
+            ? {}
+            : { completionWake: command.completionWake }),
+        status,
+        result: cancelled ? "Cancelled during placement." : null,
+        ...(command.type === "delegated_task.queue"
+          ? { queuedPlacement: command.queuedPlacement }
+          : {}),
         startedAt: now,
         completedAt: null,
         updatedAt: now,
@@ -10058,7 +10129,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         nativeItemRef: null,
         parentItemId: null,
         ordinal: yield* nextTurnItemOrdinal(parentProjection),
-        status: "running",
+        status,
         title: command.title ?? taskTitle,
         startedAt: now,
         completedAt: null,
@@ -10069,7 +10140,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         driver: command.driver,
         providerInstanceId: command.modelSelection.instanceId,
         childThreadId: null,
-        remoteChild: command.remoteChild,
+        ...(remoteChild === undefined ? {} : { remoteChild }),
         prompt: command.task,
         result: null,
       },
@@ -10082,6 +10153,57 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
    * It runs under the parent's lock, so it never interleaves with a wake
    * policy change or a delivery on the same task.
    */
+  const dispatchPlacementUpdate = Effect.fn("Orchestrator.dispatchPlacementUpdate")(function* (
+    command: Extract<
+      OrchestrationV2InternalCommand,
+      { readonly type: "delegated_task.placement.update" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const task = (yield* projectionStore
+      .getThreadRecords(command.parentThreadId, ["subagents"], { subagentIds: [command.taskId] })
+      .pipe(mapDispatchError(command))).subagents[0];
+    if (task?.queuedPlacement === undefined || task.status !== "pending" || task.result !== null)
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Queued delegation is no longer pending.",
+      });
+    if (
+      command.phase === "dispatching" &&
+      task.runId !== null &&
+      (yield* stopReachedRun(command, command.parentThreadId, task.runId))
+    )
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Parent run is stopping.",
+      });
+    const now = yield* DateTime.now;
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "subagent.updated",
+      threadId: command.parentThreadId,
+      nodeId: task.id,
+      occurredAt: now,
+      payload: {
+        ...task,
+        queuedPlacement: {
+          ...task.queuedPlacement,
+          ...(command.linkGeneration === undefined
+            ? {}
+            : { linkGeneration: command.linkGeneration }),
+          ...(command.failure === undefined ? {} : { failure: command.failure }),
+          ...(command.phase === undefined ? {} : { phase: command.phase }),
+          ...(command.cancelRequested === true ? { cancelRequested: true } : {}),
+        },
+        updatedAt: now,
+      },
+    });
+  });
+
   const dispatchRemoteDelegatedTaskComplete = Effect.fn(
     "orchestrationV2.dispatch.remoteDelegatedTaskComplete",
   )(function* (
@@ -10114,7 +10236,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (candidate) =>
         candidate.id === command.taskId &&
         candidate.origin === "app_owned" &&
-        candidate.remoteChild !== undefined,
+        (candidate.remoteChild !== undefined || candidate.queuedPlacement !== undefined),
     );
     if (task === undefined) {
       return yield* new OrchestratorDispatchError({
@@ -10135,6 +10257,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // The first result stands; a repeated follower report records nothing, which
     // the dispatcher refuses. A stop there after the result is still recorded, but
     // a run that ended by itself does not settle a stop the task here still owes.
+    if (task.result !== null && task.remoteChild === undefined) return;
     if (task.result !== null) {
       // A Stop or cancel here that lost the race to the result still owes its stop.
       if (command.stoppedThere === undefined) {
@@ -10167,6 +10290,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const now = yield* DateTime.now;
     const updatedTask: OrchestrationV2Subagent = {
       ...task,
+      ...(task.remoteChild === undefined &&
+      task.queuedPlacement !== undefined &&
+      task.queuedPlacement.linkGeneration === undefined
+        ? { queuedPlacement: { ...task.queuedPlacement, phase: "queued" as const } }
+        : {}),
       remoteChild,
       status: command.status,
       result: command.result,
@@ -15404,8 +15532,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "delegated_task.request":
         yield* dispatchDelegatedTaskRequest(command, events, effects);
         break;
+      case "delegated_task.queue":
       case "delegated_task.remote.request":
         yield* dispatchRemoteDelegatedTaskRequest(command, events);
+        break;
+      case "delegated_task.placement.update":
+        yield* dispatchPlacementUpdate(command, events);
         break;
       case "delegated_task.remote.complete":
         yield* dispatchRemoteDelegatedTaskComplete(command, events);
@@ -16303,6 +16435,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     new OrchestratorProjectionError({ threadId: ThreadId.make("thread:shell"), cause });
 
   return OrchestratorV2.of({
+    getQueuedDelegations: projectionStore.getQueuedDelegations,
     resumeQueuedRuns,
     recoverDelegatedTasks,
     recoverDelegatedTask,

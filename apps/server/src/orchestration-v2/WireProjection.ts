@@ -320,6 +320,7 @@ export function projectThreadProjectionForWire(
   };
   return {
     ...projection,
+    subagents: projection.subagents.map(projectSubagentForWire),
     checkpoints: projection.checkpoints.map(capCheckpointFiles),
     contextHandoffs: projection.contextHandoffs.map(projectContextHandoffForWire),
     turnItems: projection.turnItems.map(project),
@@ -330,9 +331,19 @@ export function projectThreadProjectionForWire(
   };
 }
 
+function projectSubagentForWire(task: OrchestrationV2Subagent): OrchestrationV2Subagent {
+  if (task.queuedPlacement === undefined) return task;
+  const { queuedPlacement: _queuedPlacement, ...projected } = task;
+  return projected;
+}
+
 export function projectDomainEventForWire(
   event: OrchestrationV2DomainEvent,
 ): OrchestrationV2DomainEvent {
+  if (event.type === "subagent.updated") {
+    const payload = projectSubagentForWire(event.payload);
+    return payload === event.payload ? event : { ...event, payload };
+  }
   return event.type === "turn-item.updated"
     ? { ...event, payload: projectTurnItemForWire(event.payload) }
     : event.type === "context-handoff.updated"

@@ -98,6 +98,7 @@ export class RemoteDelegation extends Context.Service<
       scope: ThreadScope,
       input: OrchestratorMcpDelegateTaskInput & {
         readonly baseCommit?: string;
+        readonly queuedTask?: OrchestrationV2Subagent;
         readonly target: NonNullable<OrchestratorMcpDelegateTaskInput["target"]> & {
           readonly environmentId: EnvironmentId;
         };
@@ -280,9 +281,12 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
-      const parentRun = parent.runs
-        .filter(ThreadManagement.isActiveRun)
-        .toSorted((left, right) => right.ordinal - left.ordinal)[0];
+      const parentRun =
+        input.queuedTask === undefined
+          ? parent.runs
+              .filter(ThreadManagement.isActiveRun)
+              .toSorted((left, right) => right.ordinal - left.ordinal)[0]
+          : parent.runs.find((run) => run.id === input.queuedTask?.runId);
       if (
         parentRun === undefined ||
         parentRun.rootNodeId === null ||
@@ -348,6 +352,51 @@ const make = Effect.gen(function* () {
       const key = input.clientRequestId ?? (yield* random.uuidV4());
       const task = taskPrompt(input);
       const title = input.title ?? parent.thread.title;
+      if (input.queuedTask?.queuedPlacement !== undefined) {
+        const link = yield* links.get(target.environmentId).pipe(
+          Effect.mapError(
+            () =>
+              new OrchestratorMcpFailure({
+                code: "orchestration_error",
+                message: "Unable to read the destination link.",
+              }),
+          ),
+        );
+        if (Option.isNone(link))
+          return yield* new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message: "The queued launch's destination link is unavailable.",
+          });
+        const generation = DateTime.formatIso(link.value.linkedAt);
+        if (
+          input.queuedTask.queuedPlacement.phase === "dispatching" &&
+          input.queuedTask.queuedPlacement.linkGeneration !== undefined &&
+          input.queuedTask.queuedPlacement.linkGeneration !== generation
+        )
+          return yield* new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message:
+              "The destination was relinked after an unacknowledged launch. Inspect the original worker before retrying; automatically launching through a new credential could duplicate work.",
+          });
+        if (input.queuedTask.queuedPlacement.linkGeneration !== generation)
+          yield* threads
+            .dispatch({
+              type: "delegated_task.placement.update",
+              commandId: CommandId.make(`queued-link:${input.queuedTask.id}:${generation}`),
+              parentThreadId: scope.thread.threadId,
+              taskId: input.queuedTask.id,
+              linkGeneration: generation,
+            })
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new OrchestratorMcpFailure({
+                    code: "orchestration_error",
+                    message: "Unable to pin the queued launch's destination link.",
+                  }),
+              ),
+            );
+      }
       const launched = yield* forwarding.call(
         scope,
         ProjectToolkit.tools.t3_thread_launch,
@@ -395,6 +444,7 @@ const make = Effect.gen(function* () {
       const recorded = yield* threads
         .dispatch({
           type: "delegated_task.remote.request",
+          ...(input.queuedTask === undefined ? {} : { queuedTaskId: input.queuedTask.id }),
           commandId,
           parentThreadId: scope.thread.threadId,
           parentRunId: parentRun.id,

@@ -2822,7 +2822,8 @@ describe("OrchestratorMcpService provider resolution", () => {
                     : childProjection,
                 ),
               ),
-            hasReceipt: () => Ref.get(accepted),
+            hasReceipt: (commandId) =>
+              commandId.endsWith(":queue") ? Effect.succeed(false) : Ref.get(accepted),
             isProviderInstanceEnabledForProject: () =>
               Ref.get(everyCandidateDisabled).pipe(Effect.map((disabled) => !disabled)),
             assertProviderInstanceEnabled: ({ projectId, instanceId }) =>

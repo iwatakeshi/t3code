@@ -110,6 +110,7 @@ import Migration0099 from "./Migrations/099_DelegatedTaskPlacements.ts";
 import Migration0100 from "./Migrations/100_DelegatedTaskRequirements.ts";
 import Migration0101 from "./Migrations/101_DelegatedTaskWorkspaces.ts";
 import Migration0102 from "./Migrations/102_DelegatedCapacityIndex.ts";
+import Migration0103 from "./Migrations/103_QueuedDelegations.ts";
 
 const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -215,6 +216,7 @@ const migrationEntries = [
   [100, "DelegatedTaskRequirements", Migration0100],
   [101, "DelegatedTaskWorkspaces", Migration0101],
   [102, "DelegatedCapacityIndex", Migration0102],
+  [103, "QueuedDelegations", Migration0103],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

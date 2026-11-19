@@ -132,6 +132,7 @@ function layerProjectionStore(
   return Layer.succeed(
     ProjectionStore.ProjectionStoreV2,
     ProjectionStore.ProjectionStoreV2.of({
+      getQueuedDelegations: Effect.succeed([]),
       apply: () => Effect.void,
       getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
       getLimitRecoveryWakeAt: () => Effect.die("unused getLimitRecoveryWakeAt"),

@@ -1,7 +1,13 @@
+import * as Struct from "effect/Struct";
+import { derive as deriveIds } from "@t3tools/provider-core/server/IdAllocator";
+import { forkParked } from "../serverActivation.ts";
+import * as Queue from "effect/Queue";
+import type * as Scope from "effect/Scope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { delegatedCapacityError } from "../orchestration-v2/DelegatedCapacity.ts";
 import {
   CommandId,
+  ProviderDriverKind,
   type RunId,
   isProviderAvailable,
   MessageId,
@@ -22,7 +28,7 @@ import {
   type OrchestratorMcpCreateThreadsInput,
   type OrchestratorMcpCreateThreadsResult,
   type OrchestratorMcpCreatedThread,
-  type OrchestratorMcpDelegateTaskInput,
+  OrchestratorMcpDelegateTaskInput,
   type OrchestratorMcpDelegateTaskResult,
   type OrchestratorMcpDeleteScheduledTaskInput,
   type OrchestratorMcpRequestSecretInput,
@@ -175,6 +181,8 @@ type TerminalTaskStatus = Extract<
 >;
 
 export interface OrchestratorMcpServiceShape {
+  readonly resumeQueuedDelegations: Effect.Effect<number, OrchestratorMcpFailure>;
+  readonly startQueuedDelegations: () => Effect.Effect<void, never, Scope.Scope>;
   readonly capabilities: (
     scope: McpInvocationScope,
     input?: OrchestratorMcpCapabilitiesInput,
@@ -1720,11 +1728,59 @@ const make = Effect.gen(function* () {
         candidate.origin === "app_owned" &&
         candidate.threadId === scope.thread.threadId,
     );
-    if (task === undefined || (task.childThreadId === null && task.remoteChild === undefined)) {
+    if (
+      task === undefined ||
+      (task.childThreadId === null &&
+        task.remoteChild === undefined &&
+        task.queuedPlacement === undefined)
+    ) {
       return yield* failure(
         "task_not_found",
         `Delegated task ${taskId} does not belong to thread ${scope.thread.threadId}.`,
       );
+    }
+    if (
+      task.queuedPlacement !== undefined &&
+      task.childThreadId === null &&
+      task.remoteChild === undefined
+    ) {
+      const terminal = task.result !== null;
+      const terminalStatus =
+        task.status === "cancelled"
+          ? "cancelled"
+          : task.status === "interrupted"
+            ? "interrupted"
+            : "failed";
+      const status = terminal
+        ? terminalStatus
+        : task.queuedPlacement.phase === "dispatching"
+          ? "starting"
+          : "queued";
+      return {
+        taskId: task.id,
+        ...(task.queuedPlacement.baseCommit === undefined
+          ? {}
+          : { baseCommit: task.queuedPlacement.baseCommit }),
+        childThreadId: null,
+        childRunId: null,
+        childNodeId: task.id,
+        status,
+        workState: terminal ? "result_available" : "working",
+        hasPendingChildRuns: !terminal,
+        latestTerminalRunId: null,
+        latestTerminalStatus: terminal ? terminalStatus : null,
+        latestTerminalSummary: task.result,
+        latestTerminalResultContextTransferId: null,
+        providerInstanceId: task.providerInstanceId,
+        model: task.model,
+        options: task.modelSelection?.options,
+        summary: task.result ?? task.queuedPlacement.failure ?? null,
+        resultContextTransferId: null,
+        hasPendingQuestion: false,
+        pendingApproval: null,
+        waitTimedOut,
+        ...(terminal ? {} : { next: ORCHESTRATOR_MCP_RUNNING_TASK_NEXT }),
+      };
     }
     if (task.childThreadId === null) {
       return yield* readRemoteTask(scope, task, waitTimedOut, acknowledgeTerminal);
@@ -2267,11 +2323,70 @@ const make = Effect.gen(function* () {
     return task;
   });
 
+  const queuedRequest = OrchestratorMcpDelegateTaskInput.mapFields(Struct.omit(["task", "title"]));
+  const encodeQueuedRequest = Schema.encodeEffect(Schema.fromJsonString(queuedRequest));
+  const decodeQueuedRequest = Schema.decodeUnknownEffect(Schema.fromJsonString(queuedRequest));
+  const availability = new Map<NodeId, string>();
+  const requestLock = (scope: McpInvocationScope, key: string) =>
+    `${encodeURIComponent(scope.requestNamespace)}:${encodeURIComponent(scope.thread?.threadId ?? "")}:${encodeURIComponent(key)}`;
+  const updatePlacement = Effect.fn("OrchestratorMcpService.updatePlacement")(function* (
+    scope: McpInvocationScope,
+    taskId: NodeId,
+    update: {
+      readonly phase?: "queued" | "dispatching";
+      readonly cancelRequested?: boolean;
+      readonly failure?: string;
+    },
+  ) {
+    const threadScope = yield* requireThreadScope(scope, "delegate_task");
+    yield* threadManagement
+      .dispatch({
+        type: "delegated_task.placement.update",
+        commandId: CommandId.make(`placement:${yield* random.uuidV4()}`),
+        parentThreadId: threadScope.thread.threadId,
+        taskId,
+        ...update,
+      })
+      .pipe(Effect.mapError(threadManagementFailure));
+  });
+  const finishQueued = Effect.fn("OrchestratorMcpService.finishQueued")(function* (
+    scope: McpInvocationScope,
+    taskId: NodeId,
+    status: "failed" | "cancelled",
+    result: string,
+  ) {
+    const threadScope = yield* requireThreadScope(scope, "task_cancel");
+    yield* threadManagement
+      .dispatch({
+        type: "delegated_task.remote.complete",
+        commandId: CommandId.make(`queued:${taskId}:${status}`),
+        parentThreadId: threadScope.thread.threadId,
+        taskId,
+        status,
+        result,
+      })
+      .pipe(Effect.mapError(threadManagementFailure));
+  });
   const delegationRequests = yield* KeyedLock.make<string>();
+  const queueStarted = yield* Ref.make(false);
+  const queuedRuntimeCeiling = (mode: RuntimeMode, task: OrchestrationV2Subagent | undefined) =>
+    task?.queuedPlacement === undefined ||
+    runtimeModeRank(mode) <= runtimeModeRank(task.queuedPlacement.runtimeMode)
+      ? mode
+      : task.queuedPlacement.runtimeMode;
+  const queuedInteractionCeiling = (
+    mode: import("@t3tools/contracts").ProviderInteractionMode,
+    task: OrchestrationV2Subagent | undefined,
+  ) =>
+    task?.queuedPlacement === undefined ||
+    interactionModeRank(mode) <= interactionModeRank(task.queuedPlacement.interactionMode)
+      ? mode
+      : task.queuedPlacement.interactionMode;
   const delegateTaskAttempt = Effect.fn("OrchestratorMcpService.delegateTaskAttempt")(function* (
     callerScope: McpInvocationScope,
     input: OrchestratorMcpDelegateTaskInput,
     rejected: Set<McpInvocationScope["environmentId"]>,
+    queuedTask?: OrchestrationV2Subagent,
   ) {
     const auto = input.placement === "auto";
     yield* requireCapability(callerScope);
@@ -2286,6 +2401,14 @@ const make = Effect.gen(function* () {
       { ...input, clientRequestId: delegationKey },
       workspaceParent,
     );
+    if (
+      queuedTask?.queuedPlacement?.baseCommit !== undefined &&
+      workspace?.commitSha !== queuedTask.queuedPlacement.baseCommit
+    )
+      return yield* failure(
+        "request_conflict",
+        "The queued request's pinned commit changed. No task was started.",
+      );
     if (input.placement === "auto") {
       const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
       const providers = yield* loadProviders;
@@ -2303,9 +2426,11 @@ const make = Effect.gen(function* () {
             .pipe(
               Effect.flatMap((enabled) =>
                 enabled
-                  ? resolveRuntimeMode(parent.thread.runtimeMode, input.runtimeMode, target).pipe(
-                      Effect.as(target),
-                    )
+                  ? resolveRuntimeMode(
+                      queuedRuntimeCeiling(parent.thread.runtimeMode, queuedTask),
+                      input.runtimeMode,
+                      target,
+                    ).pipe(Effect.as(target))
                   : Effect.undefined,
               ),
             ),
@@ -2362,6 +2487,9 @@ const make = Effect.gen(function* () {
       ...(execution === undefined ? {} : { environment: execution }),
       ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
     });
+    if (queuedTask !== undefined && queuedTask.queuedPlacement?.phase !== "dispatching") {
+      yield* updatePlacement(callerScope, queuedTask.id, { phase: "dispatching" });
+    }
     return yield* Effect.gen(function* () {
       const environmentId =
         input.target === undefined
@@ -2375,6 +2503,7 @@ const make = Effect.gen(function* () {
           ...input,
           target: { ...input.target, environmentId },
           ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
+          ...(queuedTask === undefined ? {} : { queuedTask }),
         });
         return withEnvironment(
           yield* input.mode === "wait"
@@ -2392,9 +2521,14 @@ const make = Effect.gen(function* () {
           "A local task runs in this thread's project. Omit target.projectId, or pass target.environmentId to run it in that environment's project.",
         );
       }
-      const parentRun = parent.runs
-        .filter(ThreadManagementService.isActiveRun)
-        .toSorted((left, right) => right.ordinal - left.ordinal)[0];
+      const parentRun =
+        queuedTask === undefined
+          ? parent.runs
+              .filter(ThreadManagementService.isActiveRun)
+              .toSorted((left, right) => right.ordinal - left.ordinal)[0]
+          : (yield* loadThreadRecords(scope.thread.threadId, ["runs"], {
+              runIds: queuedTask.runId === null ? [] : [queuedTask.runId],
+            })).runs[0];
       if (
         parentRun === undefined ||
         parentRun.rootNodeId === null ||
@@ -2420,12 +2554,12 @@ const make = Effect.gen(function* () {
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
       const runtimeMode = yield* resolveRuntimeMode(
-        parent.thread.runtimeMode,
+        queuedRuntimeCeiling(parent.thread.runtimeMode, queuedTask),
         input.runtimeMode,
         target,
       );
       const interactionMode = yield* resolveInteractionMode(
-        parent.thread.interactionMode,
+        queuedInteractionCeiling(parent.thread.interactionMode, queuedTask),
         input.interactionMode,
       );
       const workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined =
@@ -2438,6 +2572,7 @@ const make = Effect.gen(function* () {
       const result = yield* threadManagement
         .dispatch({
           type: "delegated_task.request",
+          ...(queuedTask === undefined ? {} : { queuedTaskId: queuedTask.id }),
           createdBy: "agent",
           creationSource: "mcp",
           commandId,
@@ -2501,11 +2636,19 @@ const make = Effect.gen(function* () {
     }).pipe(
       Effect.catch((error) =>
         Effect.gen(function* () {
+          if (
+            queuedTask?.queuedPlacement?.phase === "queued" &&
+            error.code !== "orchestration_error" &&
+            error.code !== "no_available_capacity"
+          )
+            yield* updatePlacement(callerScope, queuedTask.id, { phase: "queued" });
           if (error.code === "no_available_capacity" && auto && execution !== undefined) {
             yield* delegationPlacement.reject(
               yield* requireThreadScope(callerScope, "delegate_task"),
               { ...input, clientRequestId: delegationKey },
             );
+            if (queuedTask !== undefined)
+              yield* updatePlacement(callerScope, queuedTask.id, { phase: "queued" });
             rejected.add(execution.environmentId);
           }
           return yield* error;
@@ -2514,7 +2657,225 @@ const make = Effect.gen(function* () {
     );
   });
 
-  return OrchestratorMcpService.of({
+  const tryPlacement = Effect.fn("OrchestratorMcpService.tryPlacement")(function* (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpDelegateTaskInput,
+    queued?: OrchestrationV2Subagent,
+  ) {
+    const rejected = new Set<McpInvocationScope["environmentId"]>();
+    while (true) {
+      const before = rejected.size;
+      const result = yield* delegateTaskAttempt(scope, input, rejected, queued).pipe(Effect.result);
+      if (result._tag === "Success") return result.success;
+      if (rejected.size === before) return yield* result.failure;
+    }
+  });
+
+  const service: OrchestratorMcpService["Service"] = OrchestratorMcpService.of({
+    resumeQueuedDelegations: Effect.gen(function* () {
+      const tasks = yield* threadManagement.getQueuedDelegations.pipe(
+        Effect.mapError(() => failure("orchestration_error", "Unable to read queued delegations.")),
+      );
+      const pendingIds = new Set(tasks.map((task) => task.id));
+      for (const id of availability.keys()) if (!pendingIds.has(id)) availability.delete(id);
+      const settings = yield* serverSettings.getSettings.pipe(
+        Effect.mapError(() => failure("orchestration_error", "Unable to read settings.")),
+      );
+      const observed = new Map<string, string>();
+      let started = 0;
+      for (const saved of tasks) {
+        const metadata = saved.queuedPlacement;
+        if (metadata === undefined) continue;
+        const scope: McpThreadInvocationScope = {
+          environmentId: metadata.environmentId,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 0,
+          requestNamespace: metadata.requestNamespace,
+          thread: {
+            threadId: saved.threadId,
+            providerSessionId: metadata.providerSessionId,
+            providerInstanceId: metadata.providerInstanceId,
+          },
+          client: undefined,
+        };
+        const options = yield* decodeQueuedRequest(metadata.requestJson).pipe(
+          Effect.mapError(() => failure("orchestration_error", "Invalid saved queued request.")),
+        );
+        const key = options.clientRequestId;
+        if (key === undefined) continue;
+        yield* delegationRequests
+          .withLock(
+            requestLock(scope, key),
+            Effect.gen(function* () {
+              const task = (yield* loadTasks(saved.threadId, [saved.id]))[0];
+              if (
+                task?.queuedPlacement === undefined ||
+                task.childThreadId !== null ||
+                task.remoteChild !== undefined
+              )
+                return;
+              const cancelRequested =
+                task.queuedPlacement.cancelRequested === true || task.status !== "pending";
+              const parent = yield* loadThreadRecords(saved.threadId, ["runs"], {
+                runIds: task.runId === null ? [] : [task.runId],
+              });
+              const run = parent.runs[0];
+              const parentStopped =
+                parent.thread.deletedAt !== null ||
+                run === undefined ||
+                ["interrupted", "failed", "cancelled", "rolled_back"].includes(run.status);
+              if (
+                (task.queuedPlacement.phase === "queued" ||
+                  task.queuedPlacement.linkGeneration === undefined) &&
+                (cancelRequested || parentStopped)
+              ) {
+                yield* finishQueued(scope, task.id, "cancelled", "Cancelled before placement.");
+                availability.delete(task.id);
+                return;
+              }
+              const observationKey = requestLock(scope, "availability");
+              let stamp = observed.get(observationKey);
+              if (stamp === undefined) {
+                stamp = yield* delegationPlacement.availability(scope, settings.maxDelegatedTasks);
+                observed.set(observationKey, stamp);
+              }
+              if (task.queuedPlacement.phase === "queued" && availability.get(task.id) === stamp)
+                return;
+              availability.set(task.id, stamp);
+              const input: OrchestratorMcpDelegateTaskInput = {
+                ...options,
+                task: task.prompt,
+                ...(task.title === null ? {} : { title: task.title }),
+                mode: "async",
+
+                target: {
+                  ...options.target,
+                  driverKind:
+                    options.target?.driverKind ??
+                    (options.target?.providerInstanceId === undefined ? task.driver : undefined),
+                  model: task.model ?? undefined,
+                  options: task.modelSelection?.options,
+                },
+              };
+              const queued =
+                cancelRequested || parentStopped
+                  ? { ...task, queuedPlacement: { ...task.queuedPlacement, cancelRequested: true } }
+                  : task;
+              const result = yield* tryPlacement(scope, input, queued).pipe(
+                Effect.provideService(PeerForwarding.ForwardedModeCeiling, {
+                  runtimeMode: metadata.runtimeMode,
+                  interactionMode: metadata.interactionMode,
+                }),
+                Effect.result,
+              );
+              if (result._tag === "Success") {
+                started++;
+                availability.delete(task.id);
+                if (cancelRequested || parentStopped)
+                  yield* service.cancelTask(scope, { taskId: task.id });
+              } else {
+                const latest = (yield* loadTasks(task.threadId, [task.id]))[0];
+                if (
+                  latest?.status === "pending" &&
+                  latest.queuedPlacement !== undefined &&
+                  latest.queuedPlacement.failure !== result.failure.message.slice(0, 1000)
+                )
+                  yield* updatePlacement(scope, task.id, {
+                    failure: result.failure.message.slice(0, 1000),
+                  });
+                if (
+                  ![
+                    "no_available_capacity",
+                    "no_compatible_environment",
+                    "orchestration_error",
+                    "capability_denied",
+                  ].includes(result.failure.code)
+                ) {
+                  const latest = (yield* loadTasks(task.threadId, [task.id]))[0];
+                  if (latest?.queuedPlacement?.phase === "queued")
+                    yield* finishQueued(scope, task.id, "failed", result.failure.message);
+                }
+              }
+            }),
+          )
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Queued delegation could not advance", {
+                taskId: saved.id,
+                code: error.code,
+              }),
+            ),
+          );
+      }
+      return started;
+    }).pipe(Effect.withSpan("OrchestratorMcpService.resumeQueuedDelegations")),
+    startQueuedDelegations: Effect.fn("OrchestratorMcpService.startQueuedDelegations")(
+      function* () {
+        if (yield* Ref.getAndSet(queueStarted, true)) return;
+        return yield* forkParked(
+          Effect.gen(function* () {
+            const wake = yield* Queue.sliding<void>(1);
+            let waitingForCapacity = false;
+            const released = new Set([
+              "completed",
+              "failed",
+              "cancelled",
+              "interrupted",
+              "rolled_back",
+            ]);
+            yield* threadManagement.streamDomainEvents.pipe(
+              Stream.filter((event) => {
+                if (event.type === "subagent.updated")
+                  return (
+                    (event.payload.origin === "app_owned" &&
+                      event.payload.status === "pending" &&
+                      event.payload.childThreadId === null &&
+                      event.payload.remoteChild === undefined) ||
+                    (waitingForCapacity &&
+                      event.payload.origin === "app_owned" &&
+                      released.has(event.payload.status))
+                  );
+                return (
+                  waitingForCapacity &&
+                  ((event.type === "run.updated" && released.has(event.payload.status)) ||
+                    event.type === "thread.metadata-updated" ||
+                    event.type === "thread.deleted")
+                );
+              }),
+              Stream.runForEach(() => Queue.offer(wake, undefined)),
+              Effect.forkScoped,
+            );
+            yield* serverSettings.streamChanges.pipe(
+              Stream.runForEach(() =>
+                waitingForCapacity
+                  ? Effect.sync(() => availability.clear()).pipe(
+                      Effect.andThen(Queue.offer(wake, undefined)),
+                    )
+                  : Effect.void,
+              ),
+              Effect.forkScoped,
+            );
+            while (true) {
+              yield* service.resumeQueuedDelegations.pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning("Queued delegation recovery failed", { code: error.code }),
+                ),
+              );
+              const pending = yield* threadManagement.getQueuedDelegations.pipe(
+                Effect.orElseSucceed(() => []),
+              );
+              waitingForCapacity = pending.length > 0;
+              if (!waitingForCapacity) yield* Queue.take(wake);
+              else
+                yield* Queue.take(wake).pipe(
+                  Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.void }),
+                );
+            }
+          }).pipe(Effect.ignoreCause({ log: true })),
+        );
+      },
+    ),
+
     scheduleTask: Effect.fn("OrchestratorMcpService.scheduleTask")(function* (scope, input) {
       const { parent, limits } = yield* loadCaller(scope, ["runs"]);
       const projectId = yield* resolveProjectTarget(parent, input.projectId);
@@ -2928,18 +3289,152 @@ const make = Effect.gen(function* () {
       };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (scope, request) {
+      yield* requireCapability(scope);
+      if (request.onBusy === "queue" && request.placement !== "auto")
+        return yield* failure("invalid_request", "onBusy queue requires Auto placement.");
       const clientRequestId = yield* requestKey(request.clientRequestId);
       const input = { ...request, clientRequestId };
       return yield* delegationRequests.withLock(
-        `${encodeURIComponent(scope.requestNamespace)}:${encodeURIComponent(scope.thread?.threadId ?? "")}:${encodeURIComponent(clientRequestId)}`,
+        requestLock(scope, clientRequestId),
         Effect.gen(function* () {
-          const rejected = new Set<McpInvocationScope["environmentId"]>();
-          while (true) {
-            const before = rejected.size;
-            const result = yield* delegateTaskAttempt(scope, input, rejected).pipe(Effect.result);
-            if (result._tag === "Success") return result.success;
-            if (rejected.size === before) return yield* result.failure;
+          const threadScope = yield* requireThreadScope(scope, "delegate_task");
+          const commandId = stableCommandId({
+            scope,
+            requestKey: clientRequestId,
+            operation: "delegate-task",
+          });
+          if (yield* threadManagement.hasReceipt(CommandId.make(`${commandId}:queue`))) {
+            const parent = yield* loadThreadRecords(threadScope.thread.threadId, []);
+            yield* delegationPlacement.pinWorkspace(threadScope, input, parent.thread);
+            const id = deriveIds.delegatedTaskNode({ commandId });
+            const current = (yield* loadTasks(threadScope.thread.threadId, [id]))[0];
+            if (current?.queuedPlacement !== undefined) {
+              const { task: _task, title: _title, ...options } = input;
+              const saved = yield* encodeQueuedRequest(options).pipe(
+                Effect.mapError(() => failure("invalid_request", "Invalid queued request.")),
+              );
+              if (
+                current.prompt !== input.task ||
+                current.title !== (input.title ?? null) ||
+                saved !== current.queuedPlacement.requestJson
+              )
+                return yield* failure(
+                  "request_conflict",
+                  "This clientRequestId already names a different queued request.",
+                );
+            }
+            if (
+              current?.queuedPlacement !== undefined &&
+              current.status === "pending" &&
+              current.queuedPlacement.phase === "queued"
+            ) {
+              availability.delete(id);
+              yield* updatePlacement(scope, id, { phase: "queued" });
+            }
+            return yield* readTask(threadScope, id);
           }
+          const result = yield* tryPlacement(scope, input).pipe(Effect.result);
+          if (result._tag === "Success") return result.success;
+          if (input.onBusy !== "queue" || result.failure.code !== "no_available_capacity")
+            return yield* result.failure;
+          const { parent } = yield* loadThreadCaller(scope, "delegate_task");
+          const run = parent.runs
+            .filter(ThreadManagementService.isActiveRun)
+            .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+          if (
+            run?.rootNodeId == null ||
+            run.providerInstanceId !== threadScope.thread.providerInstanceId
+          )
+            return yield* failure(
+              "parent_not_active",
+              "Queued delegation requires an active parent run.",
+            );
+          const providers = yield* loadProviders;
+          const inherited = parent.thread.modelSelection;
+          const driver =
+            input.target?.driverKind ??
+            providers.find((provider) => provider.instanceId === inherited.instanceId)?.driver ??
+            ProviderDriverKind.make("remote");
+          const model = input.target?.model ?? inherited.model;
+          const sameSelection =
+            model === inherited.model &&
+            (input.target?.providerInstanceId === undefined ||
+              input.target.providerInstanceId === inherited.instanceId) &&
+            (input.target?.driverKind === undefined ||
+              input.target.driverKind ===
+                providers.find((provider) => provider.instanceId === inherited.instanceId)?.driver);
+          const inheritedOptions = sameSelection ? (inherited.options ?? []) : [];
+          const selectedOptions =
+            input.target?.options?.length === 0
+              ? []
+              : [
+                  ...new Map(
+                    [...inheritedOptions, ...(input.target?.options ?? [])].map((option) => [
+                      option.id,
+                      option,
+                    ]),
+                  ).values(),
+                ];
+          const modelSelection = {
+            instanceId: input.target?.providerInstanceId ?? inherited.instanceId,
+            model,
+            ...(selectedOptions.length === 0 ? {} : { options: selectedOptions }),
+          };
+          const { task: _task, title: _title, ...options } = input;
+          const requestJson = yield* encodeQueuedRequest(options).pipe(
+            Effect.mapError(() => failure("invalid_request", "Invalid queued request.")),
+          );
+          const runtimeMode = yield* resolveRuntimeMode(
+            parent.thread.runtimeMode,
+            input.runtimeMode,
+          );
+          const interactionMode = yield* resolveInteractionMode(
+            parent.thread.interactionMode,
+            input.interactionMode,
+          );
+          const workspace = yield* delegationPlacement.pinWorkspace(
+            threadScope,
+            input,
+            parent.thread,
+          );
+          const accepted = yield* threadManagement
+            .dispatch({
+              type: "delegated_task.queue",
+              commandId: CommandId.make(`${commandId}:queue`),
+              parentThreadId: parent.thread.id,
+              parentRunId: run.id,
+              parentNodeId: run.rootNodeId,
+              task: input.task,
+              ...(input.title === undefined ? {} : { title: input.title }),
+              modelSelection,
+              driver,
+              queuedPlacement: {
+                requestNamespace: scope.requestNamespace,
+                providerSessionId: threadScope.thread.providerSessionId,
+                providerInstanceId: threadScope.thread.providerInstanceId,
+                environmentId: scope.environmentId,
+                commandId,
+                requestJson,
+                ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
+                runtimeMode,
+                interactionMode,
+                phase: "queued",
+              },
+            })
+            .pipe(Effect.mapError(threadManagementFailure));
+          const task = accepted.storedEvents.find(
+            ({ event }) => event.type === "subagent.updated",
+          )?.event;
+          if (task?.type !== "subagent.updated")
+            return yield* failure("orchestration_error", "Queued task was not recorded.");
+          const settings = yield* serverSettings.getSettings.pipe(
+            Effect.mapError(() => failure("orchestration_error", "Unable to read settings.")),
+          );
+          yield* delegationPlacement.availability(threadScope, settings.maxDelegatedTasks).pipe(
+            Effect.tap((stamp) => Effect.sync(() => availability.set(task.payload.id, stamp))),
+            Effect.ignore,
+          );
+          return yield* readTask(threadScope, task.payload.id);
         }),
       );
     }),
@@ -2948,7 +3443,46 @@ const make = Effect.gen(function* () {
       return yield* readTask(scope, taskId, false, true);
     }),
     cancelTask: Effect.fn("OrchestratorMcpService.cancelTask")(function* (callerScope, input) {
+      yield* requireCapability(callerScope);
       const scope = yield* requireThreadScope(callerScope, "task_cancel");
+      const queued = (yield* loadTasks(scope.thread.threadId, [input.taskId]))[0];
+      if (
+        queued?.queuedPlacement !== undefined &&
+        queued.childThreadId === null &&
+        queued.remoteChild === undefined
+      ) {
+        const saved = yield* decodeQueuedRequest(queued.queuedPlacement.requestJson).pipe(
+          Effect.mapError(() => failure("orchestration_error", "Invalid saved queued request.")),
+        );
+        return yield* delegationRequests.withLock(
+          requestLock(
+            { ...scope, requestNamespace: queued.queuedPlacement!.requestNamespace },
+            saved.clientRequestId ?? "",
+          ),
+          Effect.gen(function* () {
+            const latest = (yield* loadTasks(scope.thread.threadId, [input.taskId]))[0];
+            if (latest?.queuedPlacement === undefined)
+              return yield* service.cancelTask(scope, input);
+            if (latest.result !== null)
+              return {
+                taskId: input.taskId,
+                status:
+                  latest.status === "cancelled"
+                    ? ("cancelled" as const)
+                    : latest.status === "interrupted"
+                      ? ("interrupted" as const)
+                      : ("failed" as const),
+              };
+            if (latest.queuedPlacement.phase === "dispatching")
+              yield* updatePlacement(scope, latest.id, { cancelRequested: true });
+            else {
+              yield* finishQueued(scope, latest.id, "cancelled", "Cancelled before placement.");
+              availability.delete(latest.id);
+            }
+            return { taskId: input.taskId, status: "cancel_requested" as const };
+          }),
+        );
+      }
       const current = yield* readTask(scope, input.taskId);
       const childThreadId = current.childThreadId;
       if (childThreadId === null) {
@@ -3784,6 +4318,7 @@ const make = Effect.gen(function* () {
       } satisfies OrchestratorMcpThreadInterruptResult;
     }),
   });
+  return service;
 });
 
 export const layer: Layer.Layer<

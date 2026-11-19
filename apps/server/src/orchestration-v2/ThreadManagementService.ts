@@ -127,6 +127,8 @@ function existingThreadIdsForCommand(
     case "delegated_task.wake-policy":
     case "delegated_task.completion-delivery.acknowledge":
     case "delegated_task.completion-delivery.dispose":
+    case "delegated_task.queue":
+    case "delegated_task.placement.update":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
     case "delegated_task.remote.stop":
@@ -521,6 +523,7 @@ export interface ThreadManagementServiceShape {
     void,
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
+  readonly getQueuedDelegations: Orchestrator.OrchestratorV2["Service"]["getQueuedDelegations"];
   readonly getThreadEventSequence: Orchestrator.OrchestratorV2["Service"]["getThreadEventSequence"];
   readonly recoverDelegatedTask: Orchestrator.OrchestratorV2["Service"]["recoverDelegatedTask"];
   readonly cancelDelegatedTask: Orchestrator.OrchestratorV2["Service"]["cancelDelegatedTask"];
@@ -1622,7 +1625,11 @@ const make = Effect.gen(function* () {
       if (task.childThreadId === null) {
         // A task in a linked environment ends here; its follower then stops it there.
         // One with its result keeps it, but its thread there may run follow-up work.
-        if (task.remoteChild === undefined) continue;
+        if (
+          task.remoteChild === undefined &&
+          (task.queuedPlacement === undefined || task.result !== null)
+        )
+          continue;
         const commandId = CommandId.make(`${input.commandId}:stop:${task.id}`);
         yield* (input.remoteDispatch ?? dispatch)(
           task.result === null
@@ -1786,6 +1793,7 @@ const make = Effect.gen(function* () {
     recoverDelegatedTask: orchestrator.recoverDelegatedTask,
     cancelDelegatedTask: orchestrator.cancelDelegatedTask,
     delegatedTaskResultPending: orchestrator.delegatedTaskResultPending,
+    getQueuedDelegations: orchestrator.getQueuedDelegations,
     streamStoredEvents: orchestrator.streamStoredEvents,
     streamStoredEventsFrom: orchestrator.streamStoredEventsFrom,
     streamDomainEvents: orchestrator.streamDomainEvents,

@@ -434,7 +434,8 @@ Set a worker's `maxDelegatedTasks` preference with
 can target a linked environment too.
 
 A slot covers one unfinished delegated branch, including checkout preparation
-and queued work. A first local child reuses its parent's slot; additional local
+and turns queued on that worker. Work awaiting Auto placement holds no worker slot.
+A first local child reuses its parent's slot; additional local
 children need their own slots. A parent keeps its slot until it and its local
 children finish. Remote children use capacity on their own machine. Completion,
 failure and cancellation release capacity through saved task state, which also
@@ -442,9 +443,23 @@ survives restarts. Ordinary user threads and provider-native subagents are outsi
 this limit, so it is not a hard cap on processes or CPU use.
 
 A full worker refuses before accepting work. Auto then tries another eligible
-machine, without changing the pinned commit. If all are full, it returns
-`no_available_capacity` without queuing. Connection failures keep the destination
-pinned: the worker may already have accepted the task, so retry with the same key.
+machine, without changing the pinned commit. By default, if all are full, it
+returns `no_available_capacity` without queuing.
+
+For work that can wait, use `placement: "auto", onBusy: "queue"`. The call returns
+a queued task immediately, including in wait mode. `task_status` and `task_cancel`
+use that task's original ID. The queue survives a server restart and keeps the
+captured model, modes, requirements and worktree commit. Capacity is checked every
+few seconds while work waits, and dispatch rechecks permissions. Cancelling before
+dispatch or stopping the parent prevents it from starting. Completion wakes the
+parent through the normal delegated-task path.
+
+A launch with an uncertain reply stays on its chosen worker and reports
+`starting`. Its cancellation may wait for that worker to reconnect. Relinking
+that worker blocks automatic replay through the new credential; inspect the
+original worker first to avoid duplicate work. Retry a queued request with the
+same `clientRequestId` and arguments to request an eligibility recheck after
+changing a provider or transferring a commit.
 
 Delegation does not copy files, fetch commits, or merge results. Without
 worktree isolation, tasks share the selected project's checkout. Auto cannot

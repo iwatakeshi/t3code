@@ -172,6 +172,12 @@ export type OrchestratorMcpTerminalDelegatedTaskStatus =
 
 export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   task: OrchestratorMcpPrompt,
+  onBusy: Schema.optional(
+    Schema.Literals(["fail", "queue"]).annotate({
+      description:
+        "Auto only. Default fail. queue durably waits for capacity and returns a queued task immediately; task_status and task_cancel use the same taskId.",
+    }),
+  ),
   requirements: Schema.optional(ExecutionRequirements),
   placement: Schema.optional(
     Schema.Literal("auto").annotate({
@@ -233,7 +239,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
       platform: ExecutionEnvironmentPlatform,
     }),
   ),
-  /** Null for a task that runs in a linked environment; see `remoteChild`. */
+  /** Null while awaiting placement or when running in a linked environment. */
   childThreadId: Schema.NullOr(ThreadId),
   /** The linked environment and thread a remote task runs as. */
   remoteChild: Schema.optional(

@@ -1,3 +1,8 @@
+import {
+  projectThreadProjectionForWire,
+  projectDomainEventForWire,
+} from "../orchestration-v2/WireProjection.ts";
+import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
 import { DelegatedCapacityError } from "../orchestration-v2/DelegatedCapacity.ts";
 import * as DocumentText from "../provider/DocumentText.ts";
 import { NodeHttpServer } from "@effect/platform-node";
@@ -97,6 +102,7 @@ type LaunchedWith = Pick<
 
 /** The thread the box launches for the task, which the test finishes. */
 interface BoxThread {
+  readonly resourceCpu: Ref.Ref<number | null>;
   readonly admits: Ref.Ref<boolean>;
   readonly launches: Ref.Ref<number>;
   readonly hasCommit: Ref.Ref<boolean>;
@@ -151,11 +157,12 @@ interface BoxThread {
   /** Messages sent to the thread there after its launch, each starting a later run. */
   readonly sent: Ref.Ref<ReadonlyArray<string>>;
   /** Runs as the launch there is answered, before the laptop hears back. */
-  readonly afterLaunch: Ref.Ref<Effect.Effect<void>>;
+  readonly afterLaunch: Ref.Ref<Effect.Effect<void, ThreadLaunch.ThreadLaunchError>>;
 }
 
 const makeBoxThread = Effect.gen(function* () {
   return {
+    resourceCpu: yield* Ref.make<number | null>(null),
     admits: yield* Ref.make(true),
     launches: yield* Ref.make(0),
     hasCommit: yield* Ref.make(true),
@@ -192,7 +199,7 @@ const makeBoxThread = Effect.gen(function* () {
     stopStarted: yield* Deferred.make<void>(),
     releaseStop: yield* Deferred.make<void>(),
     sent: yield* Ref.make<ReadonlyArray<string>>([]),
-    afterLaunch: yield* Ref.make<Effect.Effect<void>>(Effect.void),
+    afterLaunch: yield* Ref.make<Effect.Effect<void, ThreadLaunch.ThreadLaunchError>>(Effect.void),
   } satisfies BoxThread;
 });
 
@@ -586,15 +593,17 @@ const boxToolkitLayer = (thread: BoxThread) => {
       Layer.merge(
         NodeCrypto.layer,
         Layer.mock(HostResources.HostResources)({
-          read: Ref.get(thread.admits).pipe(
-            Effect.map((admits) => ({
+          read: Effect.gen(function* () {
+            const admits = yield* Ref.get(thread.admits);
+            const resourceCpu = yield* Ref.get(thread.resourceCpu);
+            return {
               sampledAt: 0,
-              cpuUtilization: admits ? 0.1 : 0.01,
+              cpuUtilization: resourceCpu ?? (admits ? 0.1 : 0.01),
               cpuCount: 8,
               totalMemoryBytes: 16_000,
               availableMemoryBytes: 12_000,
-            })),
-          ),
+            };
+          }),
         }),
       ),
     ),
@@ -733,7 +742,10 @@ const makeLaptop = (
       Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
       Layer.provideMerge(Layer.merge(layerOrchestrator, ServerSettings.layerTest())),
     );
-    const layerHere = McpHttpServer.layerOrchestratorToolkit.pipe(
+    const layerHere = Layer.merge(
+      McpHttpServer.layerOrchestratorToolkit,
+      OrchestratorMcpService.layer,
+    ).pipe(
       Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
       Layer.provideMerge(
         RemoteDelegation.layer.pipe(
@@ -783,7 +795,17 @@ const makeLaptop = (
           ),
           Layer.provide(PeerForwarding.layer),
           Layer.provide(Layer.succeedContext(database)),
-          Layer.provide(Layer.mock(HostResources.HostResources)({})),
+          Layer.provide(
+            Layer.mock(HostResources.HostResources)({
+              read: Effect.succeed({
+                sampledAt: 0,
+                cpuUtilization: 0.1,
+                cpuCount: 4,
+                totalMemoryBytes: 16_000,
+                availableMemoryBytes: 12_000,
+              }),
+            }),
+          ),
           Layer.provide(
             Layer.mock(ProjectService.ProjectService)({
               getById: () => Effect.succeedSome({ workspaceRoot: "/home/me/app" } as never),
@@ -819,9 +841,11 @@ const makeLaptop = (
     const here = yield* Layer.build(layerHere);
     const server = Context.get(here, McpServer.McpServer);
     return {
+      linking,
       links: Context.get(linking, PeerLinks.PeerLinks),
       settings: Context.get(linking, ServerSettings.ServerSettingsService),
       orchestrator: Context.get(here, Orchestrator.OrchestratorV2),
+      mcp: Context.get(here, OrchestratorMcpService.OrchestratorMcpService),
       remote: Context.get(here, RemoteDelegation.RemoteDelegation),
       threads: Context.get(here, ThreadManagement.ThreadManagementService),
       projections: Context.get(here, ProjectionStore.ProjectionStoreV2),
@@ -1136,6 +1160,250 @@ it.effect("Auto retries another worker only after an authoritative capacity refu
       yield* Deferred.succeed(idle.finished, undefined);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each(["shared", "worktree"] as const)(
+  "Auto queue survives restart and starts %s work after capacity changes",
+  (isolation) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        yield* Ref.set(thread.resourceCpu, 0.99);
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const a = yield* makeLaptop(database, offers);
+        yield* linkTo(a.links, b, isolation === "shared" ? "auto" : "full-access");
+        yield* seedParent(a);
+        const input = {
+          task: "Review when compute is available",
+          placement: "auto",
+          onBusy: "queue",
+          isolation,
+          requirements: { os: ["linux"] },
+          target: { driverKind: boxClaude.driver, model: "claude-sonnet-4-6" },
+          clientRequestId: "durable-review",
+        };
+        const queued = yield* a.call("delegate_task", input);
+        expect(queued.isError, JSON.stringify(queued.content)).toBe(false);
+        expect(queued.structuredContent).toMatchObject({ status: "queued", childThreadId: null });
+        const taskId = (queued.structuredContent as { taskId: NodeId }).taskId;
+        expect((yield* a.call("delegate_task", input)).structuredContent).toMatchObject({
+          taskId,
+          status: "queued",
+        });
+        expect(yield* a.mcp.resumeQueuedDelegations).toBe(0);
+        expect(yield* Ref.get(thread.launches)).toBe(0);
+        const changed = yield* a.call("delegate_task", { ...input, task: "Different work" });
+        expect(changed.isError).toBe(true);
+        expect(changed.content).toMatchObject([
+          { text: expect.stringContaining("request_conflict") },
+        ]);
+        const parent = yield* a.orchestrator.getThreadProjection(parentThreadId);
+        if (isolation === "worktree")
+          expect(queued.structuredContent).toMatchObject({ baseCommit: parentCommit });
+        if (isolation === "shared") {
+          const task = parent.subagents.find((task) => task.id === taskId)!;
+          expect(task.queuedPlacement).toBeDefined();
+          expect(
+            projectThreadProjectionForWire(parent).subagents.find((task) => task.id === taskId)
+              ?.queuedPlacement,
+          ).toBeUndefined();
+          const projected = projectDomainEventForWire({
+            id: EventId.make("queued-private-metadata"),
+            type: "subagent.updated",
+            threadId: parentThreadId,
+            occurredAt: task.updatedAt,
+            payload: task,
+          });
+          expect(
+            projected.type === "subagent.updated" ? projected.payload.queuedPlacement : null,
+          ).toBeUndefined();
+        }
+        const run = parent.runs[0]!;
+        yield* a.sink.write({
+          events: [
+            {
+              id: EventId.make("parent-returned"),
+              type: "run.updated",
+              threadId: parentThreadId,
+              occurredAt: yield* DateTime.now,
+              payload: { ...run, status: "completed", completedAt: yield* DateTime.now },
+            },
+          ],
+        });
+        const restarted = yield* makeLaptop(database, offers, a.linking);
+        expect((yield* restarted.call("task_status", { taskId })).structuredContent).toMatchObject({
+          taskId,
+          status: "queued",
+        });
+        yield* Ref.set(thread.resourceCpu, 0.1);
+        const attached = yield* restarted.orchestrator
+          .streamStoredEventsFrom({
+            threadId: parentThreadId,
+            afterSequence: 0,
+            eventType: "subagent.updated",
+          })
+          .pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "subagent.updated" &&
+                event.payload.id === taskId &&
+                event.payload.remoteChild !== undefined,
+            ),
+            Stream.runHead,
+            Effect.forkChild,
+          );
+        yield* restarted.mcp.startQueuedDelegations();
+        yield* Fiber.join(attached);
+        const running = yield* restarted.call("task_status", { taskId });
+        expect(running.structuredContent).toMatchObject({
+          taskId,
+          remoteChild: { environmentId: box.environmentId },
+        });
+        expect(yield* Ref.get(thread.launches)).toBe(1);
+        expect(yield* restarted.mcp.resumeQueuedDelegations).toBe(0);
+        expect(yield* Ref.get(thread.launchedWith)).toMatchObject({
+          runtimeMode: isolation === "shared" ? "auto" : "full-access",
+          modelSelection: { instanceId: boxClaude.instanceId, model: "claude-sonnet-4-6" },
+          workspaceStrategy:
+            isolation === "worktree"
+              ? { type: "worktree", baseRef: parentCommit, startFromOrigin: false }
+              : { type: "root" },
+        });
+        yield* Ref.set(thread.reply, "Queued review complete.");
+        yield* Ref.set(thread.status, "completed");
+        yield* Deferred.succeed(thread.finished, undefined);
+        expect(yield* taskResult(restarted, taskId)).toMatchObject({
+          status: "completed",
+          result: "Queued review complete.",
+        });
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each(["cancel", "parent-stop"] as const)(
+  "queued %s is durable and cannot dispatch when capacity returns",
+  (action) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        yield* Ref.set(thread.resourceCpu, 0.99);
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const a = yield* makeLaptop(database, offers);
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const input = {
+          task: "Do not run after cancellation",
+          placement: "auto",
+          onBusy: "queue",
+          target: { driverKind: boxClaude.driver, model: "claude-sonnet-4-6" },
+          clientRequestId: "cancel-queued",
+        };
+        const queued = yield* a.call("delegate_task", input);
+        expect(queued.isError, JSON.stringify(queued.content)).toBe(false);
+        const taskId = (queued.structuredContent as { taskId: NodeId }).taskId;
+        if (action === "cancel") {
+          const cancelled = yield* a.call("task_cancel", { taskId });
+          expect(cancelled.isError, JSON.stringify(cancelled.content)).toBe(false);
+        } else {
+          yield* a.threads.stopDelegatedTasks({
+            threadId: parentThreadId,
+            commandId: CommandId.make("stop-parent"),
+          });
+        }
+        expect((yield* a.call("task_status", { taskId })).structuredContent).toMatchObject({
+          status: action === "cancel" ? "cancelled" : "interrupted",
+        });
+        yield* Ref.set(thread.resourceCpu, 0.1);
+        const restarted = yield* makeLaptop(database, offers, a.linking);
+        expect(yield* restarted.mcp.resumeQueuedDelegations).toBe(0);
+        expect((yield* restarted.call("delegate_task", input)).structuredContent).toMatchObject({
+          taskId,
+          status: action === "cancel" ? "cancelled" : "interrupted",
+        });
+        expect(yield* Ref.get(thread.launches)).toBe(0);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each(["cancel", "relink"] as const)(
+  "an unacknowledged queued launch stays pinned after %s",
+  (action) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        yield* Ref.set(thread.resourceCpu, 0.99);
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const a = yield* makeLaptop(database, offers);
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const input = {
+          task: "Recover this accepted launch",
+          placement: "auto",
+          onBusy: "queue",
+          target: { driverKind: boxClaude.driver, model: "claude-sonnet-4-6" },
+          clientRequestId: "lost-launch-reply",
+        };
+        const queued = yield* a.call("delegate_task", input);
+        expect(queued.isError, JSON.stringify(queued.content)).toBe(false);
+        const taskId = (queued.structuredContent as { taskId: NodeId }).taskId;
+        yield* Ref.set(thread.resourceCpu, 0.1);
+        yield* Ref.set(
+          thread.afterLaunch,
+          Effect.fail(
+            new ThreadLaunch.ThreadLaunchError({
+              commandId: CommandId.make("reply-failed"),
+              projectId: boxProject,
+              operation: "resolve-project",
+              cause: "Reply lost after the destination accepted.",
+            }),
+          ),
+        );
+        expect(yield* a.mcp.resumeQueuedDelegations).toBe(0);
+        expect((yield* a.call("task_status", { taskId })).structuredContent).toMatchObject({
+          taskId,
+          status: "starting",
+        });
+        const childId = yield* Ref.get(thread.launched);
+        expect(childId).not.toBeNull();
+        if (action === "relink") {
+          yield* TestClock.adjust("1 millis");
+          yield* a.links.unlink(box.environmentId);
+          yield* linkTo(a.links, b, "full-access");
+          yield* Ref.set(thread.afterLaunch, Effect.void);
+          const restarted = yield* makeLaptop(database, offers, a.linking);
+          yield* restarted.mcp.resumeQueuedDelegations;
+          expect(yield* Ref.get(thread.launches)).toBe(1);
+          expect(
+            (yield* restarted.call("task_status", { taskId })).structuredContent,
+          ).toMatchObject({ status: "starting", summary: expect.stringContaining("relinked") });
+          return;
+        }
+        const cancelled = yield* a.call("task_cancel", { taskId });
+        expect(cancelled.isError, JSON.stringify(cancelled.content)).toBe(false);
+        yield* Ref.set(thread.afterLaunch, Effect.void);
+        yield* Ref.set(thread.resourceCpu, 0.99);
+        const restarted = yield* makeLaptop(database, offers, a.linking);
+        yield* restarted.mcp.resumeQueuedDelegations;
+        expect(yield* Ref.get(thread.launched)).toBe(childId);
+        expect(yield* Ref.get(thread.launches)).toBe(1);
+        yield* Deferred.await(thread.interruptedOnce);
+        expect((yield* restarted.call("task_status", { taskId })).structuredContent).toMatchObject({
+          status: "cancelled",
+        });
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect("a task delegated to the box wakes the laptop's parent when it ends there", () =>
