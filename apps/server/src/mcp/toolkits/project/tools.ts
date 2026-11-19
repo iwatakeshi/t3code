@@ -4,6 +4,7 @@ import {
   NonNegativeInt,
   ModelSelection,
   ExecutionRequirements,
+  GitCommitSha,
   TrimmedNonEmptyString,
   ThreadId,
   RunId,
@@ -73,6 +74,20 @@ const ProjectReadTool = Tool.make("t3_project_read", {
     environmentId: OrchestratorMcpEnvironmentTarget,
     projectId: ProjectId,
   }),
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false);
+const ProjectCheckCommitTool = Tool.make("t3_project_check_commit", {
+  ...shared,
+  description:
+    "Check whether a full commit SHA is available for an isolated task in this project. Reads local Git objects only; never fetches or creates a thread.",
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    projectId: ProjectId,
+    commitSha: GitCommitSha,
+  }),
+  success: Schema.Struct({ available: Schema.Boolean }),
+  dependencies: [...shared.dependencies, ThreadLaunchService.ThreadLaunchService],
 })
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false);
@@ -189,6 +204,7 @@ export const ProjectToolkit = Toolkit.make(
   ThreadLaunchTool,
   ProjectListTool,
   ProjectReadTool,
+  ProjectCheckCommitTool,
   ProjectCreateTool,
   ProjectUpdateTool,
   ProjectDeleteTool,

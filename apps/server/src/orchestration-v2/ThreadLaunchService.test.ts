@@ -396,7 +396,10 @@ it.effect.each(
           Layer.mock(SecretRequests.SecretRequests)({}),
           ManagedPolicy.layerTest(),
           Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-          Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+          Layer.mock(DelegationPlacement.DelegationPlacement)({
+            check: () => Effect.undefined,
+            pinWorkspace: () => Effect.undefined,
+          }),
         ),
       ),
     );
@@ -1472,6 +1475,129 @@ const launchFromBase = (harness: ReturnType<typeof makeHarness>, baseRef: string
     assert.equal(projection.runs[0]?.status, "starting");
   }).pipe(Effect.provide(harness.layer));
 
+it.effect("isolates the exact commit while preserving a dirty destination checkout", () =>
+  withRealGitRepo(({ cwd, worktreePath, command, harness }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(`${cwd}/file.txt`, "parent version\n");
+      yield* command(cwd, ["add", "file.txt"]);
+      yield* command(cwd, ["commit", "-m", "parent commit"]);
+      const parentSha = (yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+      yield* fs.writeFileString(`${cwd}/file.txt`, "destination version\n");
+      yield* command(cwd, ["commit", "-am", "destination commit"]);
+      const destinationSha = (yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+      yield* fs.writeFileString(`${cwd}/file.txt`, "dirty destination\n");
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        assert.isTrue(yield* launches.checkCommit({ projectId, commitSha: parentSha }));
+        const launched = yield* launches.launch(
+          launchInput({
+            command: "exact-commit",
+            thread: "exact-commit-thread",
+            message: "Implement",
+            workspace: { type: "worktree", baseRef: parentSha, startFromOrigin: false },
+          }),
+        );
+        const projection = yield* preparationSettled(launched.threadId);
+        assert.equal(projection.runs[0]?.status, "starting");
+        assert.equal(
+          (yield* command(worktreePath, ["rev-parse", "HEAD"])).stdout.trim(),
+          parentSha,
+        );
+        assert.equal(yield* fs.readFileString(`${worktreePath}/file.txt`), "parent version\n");
+        assert.equal((yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim(), destinationSha);
+        assert.equal(yield* fs.readFileString(`${cwd}/file.txt`), "dirty destination\n");
+      }).pipe(
+        Effect.provide(
+          harness({ fetchWorktreeBaseCommit: () => Effect.die("Unexpected fetch") }).layer,
+        ),
+      );
+    }),
+  ),
+);
+
+it.effect.each([true, false])(
+  "rejects an unavailable full SHA before creating a thread (unborn: %s)",
+  (unborn) =>
+    withRealGitRepo(({ cwd, worktreePath, command, harness }) =>
+      Effect.gen(function* () {
+        if (!unborn) yield* command(cwd, ["commit", "--allow-empty", "-m", "destination commit"]);
+        yield* Effect.gen(function* () {
+          const launches = yield* ThreadLaunch.ThreadLaunchService;
+          const strategy = {
+            type: "worktree" as const,
+            baseRef: "f".repeat(40),
+            startFromOrigin: false,
+          };
+          assert.isFalse(yield* launches.checkCommit({ projectId, commitSha: strategy.baseRef }));
+          const preflight = yield* launches
+            .checkWorktreeBase({ projectId, workspaceStrategy: strategy })
+            .pipe(Effect.flip);
+          assert.equal(preflight._tag, "ThreadLaunchBaseRefError");
+          const failure = yield* launches
+            .launch(
+              launchInput({
+                command: "missing-sha",
+                thread: "missing-sha-thread",
+                workspace: strategy,
+              }),
+            )
+            .pipe(Effect.flip);
+          assert.equal(failure._tag, "ThreadLaunchError");
+          const sql = yield* SqlClient.SqlClient;
+          assert.equal(
+            (yield* sql`SELECT thread_id FROM orchestration_v2_projection_threads WHERE thread_id = ${"missing-sha-thread"}`)
+              .length,
+            0,
+          );
+          const fs = yield* FileSystem.FileSystem;
+          assert.isFalse(yield* fs.exists(worktreePath));
+        }).pipe(
+          Effect.provide(
+            harness({ fetchWorktreeBaseCommit: () => Effect.die("Unexpected fetch") }).layer,
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect(
+  "fails preparation instead of falling back when a pinned commit becomes unavailable",
+  () =>
+    withRealGitRepo(({ cwd, worktreePath, command, harness }) =>
+      Effect.gen(function* () {
+        yield* command(cwd, ["commit", "--allow-empty", "-m", "parent commit"]);
+        const parentSha = (yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+        const checks = yield* Ref.make(0);
+        const guarded = harness({
+          hasCommit: ({ refName }) =>
+            refName === parentSha
+              ? Ref.updateAndGet(checks, (count) => count + 1).pipe(
+                  Effect.map((count) => count === 1),
+                )
+              : Effect.succeed(true),
+          fetchWorktreeBaseCommit: () => Effect.die("Unexpected fallback fetch"),
+        });
+        yield* Effect.gen(function* () {
+          const launches = yield* ThreadLaunch.ThreadLaunchService;
+          const launched = yield* launches.launch(
+            launchInput({
+              command: "lost-sha",
+              thread: "lost-sha-thread",
+              message: "Implement",
+              workspace: { type: "worktree", baseRef: parentSha, startFromOrigin: false },
+            }),
+          );
+          const projection = yield* preparationSettled(launched.threadId);
+          assert.equal(projection.runs[0]?.status, "failed");
+          const fs = yield* FileSystem.FileSystem;
+          assert.isFalse(yield* fs.exists(worktreePath));
+          assert.equal((yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim(), parentSha);
+        }).pipe(Effect.provide(guarded.layer));
+      }),
+    ),
+);
+
 it.effect("re-bases a stored base that no longer exists on the remote default branch", () =>
   withRealGitRepo(({ directory, cwd, worktreePath, command, harness }) =>
     Effect.gen(function* () {
@@ -2532,6 +2658,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
             ),
           ),
         checkWorktreeBase: launches.checkWorktreeBase,
+        checkCommit: launches.checkCommit,
         isNonGitProject: launches.isNonGitProject,
         retryPreparation: launches.retryPreparation,
         prepareRun: launches.prepareRun,

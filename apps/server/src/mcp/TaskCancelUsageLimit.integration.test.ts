@@ -187,7 +187,10 @@ it.effect.each([
             Layer.mock(ProjectService.ProjectService)({}),
             Layer.mock(SecretRequests.SecretRequests)({}),
             Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-            Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+            Layer.mock(DelegationPlacement.DelegationPlacement)({
+              check: () => Effect.undefined,
+              pinWorkspace: () => Effect.undefined,
+            }),
             ServerSettings.layerTest(),
             Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
             NodeServices.layer,

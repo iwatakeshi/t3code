@@ -8,6 +8,7 @@ import {
   type MessageId,
   type ModelSelection,
   type ExecutionRequirements,
+  isGitCommitSha,
   type OrchestrationV2Actor,
   type OrchestrationV2CreationSource,
   type OrchestrationV2DelegatedFrom,
@@ -143,6 +144,7 @@ export class ThreadLaunchError extends Schema.TaggedError<ThreadLaunchError>()(
   {
     operation: Schema.Literals([
       "resolve-project",
+      "check-base",
       "read-receipt",
       "generate-metadata",
       "provision-worktree",
@@ -228,9 +230,22 @@ export class ThreadLaunchNotRepositoryError extends Schema.TaggedError<ThreadLau
   }
 }
 
+export class ThreadLaunchCommitCheckError extends Schema.TaggedError<ThreadLaunchCommitCheckError>()(
+  "ThreadLaunchCommitCheckError",
+  { projectId: ProjectId, commitSha: Schema.String, cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return "Unable to check the worktree commit in this project.";
+  }
+}
+
 export class ThreadLaunchService extends Context.Service<
   ThreadLaunchService,
   {
+    readonly checkCommit: (input: {
+      readonly projectId: ProjectId;
+      readonly commitSha: string;
+    }) => Effect.Effect<boolean, ThreadLaunchCommitCheckError>;
     readonly launch: (
       input: ThreadLaunchInput,
     ) => Effect.Effect<
@@ -414,7 +429,7 @@ const make = Effect.gen(function* () {
           : // `git worktree add` reads `-` as the previous checkout.
             git
               .hasCommit({ cwd, refName: baseRef === "-" ? "@{-1}" : baseRef })
-              .pipe(Effect.orElseSucceed(() => true)),
+              .pipe(Effect.orElseSucceed(() => !isGitCommitSha(baseRef))),
         branch !== undefined
           ? git
               .listLocalBranchNames(cwd)
@@ -431,20 +446,21 @@ const make = Effect.gen(function* () {
       });
     const baseResolves =
       hasBaseCommit ||
-      (yield* Effect.gen(function* () {
-        if (strategy.startFromOrigin === true) {
-          const remote = yield* git.resolveWorktreeBaseRemote({ cwd, refName: baseRef });
-          // The remote may have deleted the branch; ask it rather than trusting the name.
-          if (
-            remote !== null &&
-            (yield* git.fetchWorktreeBaseCommit({ cwd, refName: baseRef, remote })) !== null
-          )
-            return true;
-        }
-        // git worktree add accepts remote-tracking branches; let Git decide when any matching ref exists.
-        if (yield* git.hasRefNamed({ cwd, refName: baseRef })) return true;
-        return !(yield* git.hasCommit({ cwd, refName: "HEAD" }));
-      }).pipe(Effect.orElseSucceed(() => true)));
+      (!isGitCommitSha(baseRef) &&
+        (yield* Effect.gen(function* () {
+          if (strategy.startFromOrigin === true) {
+            const remote = yield* git.resolveWorktreeBaseRemote({ cwd, refName: baseRef });
+            // The remote may have deleted the branch; ask it rather than trusting the name.
+            if (
+              remote !== null &&
+              (yield* git.fetchWorktreeBaseCommit({ cwd, refName: baseRef, remote })) !== null
+            )
+              return true;
+          }
+          // git worktree add accepts remote-tracking branches; let Git decide when any matching ref exists.
+          if (yield* git.hasRefNamed({ cwd, refName: baseRef })) return true;
+          return !(yield* git.hasCommit({ cwd, refName: "HEAD" }));
+        }).pipe(Effect.orElseSucceed(() => true))));
     if (!baseResolves)
       return yield* new ThreadLaunchBaseRefError({
         projectId: project.id,
@@ -471,6 +487,28 @@ const make = Effect.gen(function* () {
         branch,
         conflictingBranch,
       });
+  });
+
+  const checkCommit: ThreadLaunchService["Service"]["checkCommit"] = Effect.fn(
+    "ThreadLaunchService.checkCommit",
+  )(function* ({ projectId, commitSha }) {
+    if (!isGitCommitSha(commitSha) || (yield* managedFolders.isScratchProject(projectId)))
+      return false;
+    const project = yield* projects
+      .getById(projectId)
+      .pipe(
+        Effect.mapError(
+          (cause) => new ThreadLaunchCommitCheckError({ projectId, commitSha, cause }),
+        ),
+      );
+    if (Option.isNone(project)) return false;
+    return yield* git
+      .hasCommit({ cwd: project.value.workspaceRoot, refName: commitSha })
+      .pipe(
+        Effect.mapError(
+          (cause) => new ThreadLaunchCommitCheckError({ projectId, commitSha, cause }),
+        ),
+      );
   });
 
   const isNonGitProject: ThreadLaunchService["Service"]["isNonGitProject"] = Effect.fn(
@@ -707,6 +745,19 @@ const make = Effect.gen(function* () {
             })
             .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId))));
         if (!recordedBaseResolves) {
+          if (isGitCommitSha(requestedBaseRef))
+            return yield* mapError(
+              input,
+              "provision-worktree",
+              threadId,
+            )(
+              new ThreadLaunchBaseRefError({
+                projectId: project.id,
+                projectTitle: project.title,
+                workspaceRoot: project.workspaceRoot,
+                baseRef: requestedBaseRef,
+              }),
+            );
           const remoteName =
             remote?.remoteName ??
             (yield* git
@@ -1218,6 +1269,20 @@ const make = Effect.gen(function* () {
 
   const launch: ThreadLaunchService["Service"]["launch"] = Effect.fn("ThreadLaunchService.launch")(
     function* (request) {
+      if (
+        request.workspaceStrategy.type === "worktree" &&
+        isGitCommitSha(request.workspaceStrategy.baseRef) &&
+        !(yield* checkCommit({
+          projectId: request.projectId,
+          commitSha: request.workspaceStrategy.baseRef,
+        }).pipe(Effect.mapError(mapError(request, "check-base"))))
+      )
+        return yield* mapError(
+          request,
+          "check-base",
+        )(
+          "The exact worktree commit is unavailable. Transfer it to this project before launching.",
+        );
       if (request.requirements?.os !== undefined) {
         const platform = yield* HostProcess.Platform;
         const actualOs = platform === "win32" ? "windows" : platform;
@@ -1575,6 +1640,7 @@ const make = Effect.gen(function* () {
 
   return ThreadLaunchService.of({
     launch,
+    checkCommit,
     checkWorktreeBase,
     isNonGitProject,
     retryPreparation,

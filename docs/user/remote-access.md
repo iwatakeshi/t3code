@@ -419,13 +419,22 @@ advertise support for enforcing them; update an older server before using it
 for constrained work. Environment discovery and delegation replies report the
 machine's OS and architecture.
 
-Auto placement uses shared checkouts. Prepare the code on each machine before
-delegating: it does not copy files, fetch commits, or merge results. It cannot
-be combined with worktree isolation or an explicit destination. If no machine
-qualifies, the call fails without starting or queuing work. Repeating the same
-`clientRequestId` keeps the original destination and OS requirements. Changing
-or removing those requirements on a retry returns a conflict; use a new key
-for a different task.
+For independent edits, ask the agent to use `isolation: "worktree"`. The child
+gets its own checkout at the parent's exact commit, including when Auto picks
+another machine. Commit and transfer the code first: the destination must
+already have that commit. Auto excludes workers that lack it, and an explicit
+destination reports `base_unavailable` before starting a thread. Older servers
+must be updated to support delegated worktrees. The reply includes `baseCommit`
+so the agent can identify the pinned revision. Uncommitted edits stay out.
+
+Delegation does not copy files, fetch commits, or merge results. Without
+worktree isolation, tasks share the selected project's checkout. Auto cannot
+be combined with an explicit destination. If no machine qualifies, the call
+fails without starting or queuing work. Repeating the same `clientRequestId`
+keeps the original destination, OS requirements, isolation and worktree commit.
+Changing the requirements or isolation on a retry returns a conflict; use a new
+key for a different task. A failed commit-availability check can be retried with
+the same key after transferring the pinned commit to the worker.
 
 ## Manage or revoke access
 

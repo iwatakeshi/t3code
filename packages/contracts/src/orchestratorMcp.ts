@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import { ExecutionEnvironmentPlatform, ExecutionRequirements } from "./environment.ts";
+import { GitCommitSha } from "./git.ts";
 
 import { AuthMcpClientAccess } from "./auth.ts";
 import {
@@ -175,7 +176,7 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   placement: Schema.optional(
     Schema.Literal("auto").annotate({
       description:
-        "Choose this machine or a linked machine by available CPU and memory. Requires matching repository and provider. Omit target.environmentId and target.projectId. Shared checkouts only; no file synchronization.",
+        "Choose this machine or a linked machine by available CPU and memory. Requires matching repository and provider; worktree isolation also requires the parent commit there. Omit target.environmentId and target.projectId. No file synchronization.",
     }),
   ),
   // Some providers send the whole target object as JSON text.
@@ -187,7 +188,7 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   isolation: Schema.optional(
     Schema.Literals(["shared", "worktree"]).annotate({
       description:
-        "'shared' (default): parent checkout. 'worktree': new prepared checkout from the parent commit, for a separate checkout or PR per child. Uncommitted edits stay out.",
+        "'shared' (default): parent checkout. 'worktree': new prepared checkout at the parent's exact commit, which must already exist on the selected machine. No fetch or uncommitted edits. Separate checkout or PR per child.",
     }),
   ),
   mode: Schema.optional(
@@ -224,6 +225,7 @@ const OrchestratorMcpExecutedModel = Schema.NullOr(Schema.String).annotate({
 
 export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   taskId: NodeId,
+  baseCommit: Schema.optional(GitCommitSha),
   environment: Schema.optional(
     Schema.Struct({
       environmentId: EnvironmentId,
@@ -692,6 +694,7 @@ export const OrchestratorMcpEnvironmentLink = Schema.Struct({
   lastError: Schema.NullOr(Schema.String),
   platform: Schema.optional(ExecutionEnvironmentPlatform),
   executionOsRequirements: Schema.optional(Schema.Boolean),
+  delegatedWorktrees: Schema.optional(Schema.Boolean),
 });
 export type OrchestratorMcpEnvironmentLink = typeof OrchestratorMcpEnvironmentLink.Type;
 
@@ -981,6 +984,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "no_compatible_environment",
       "no_available_capacity",
       "request_conflict",
+      "base_unavailable",
     ]),
     message: Schema.String,
   },

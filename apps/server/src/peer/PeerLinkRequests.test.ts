@@ -166,7 +166,10 @@ const makeLaptopWith = (
     );
     const layerHere = McpHttpServer.layerOrchestratorToolkit.pipe(
       Layer.provide(
-        Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+        Layer.mock(DelegationPlacement.DelegationPlacement)({
+          check: () => Effect.undefined,
+          pinWorkspace: () => Effect.undefined,
+        }),
       ),
       Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
       Layer.provideMerge(PeerLinkRequests.layer),

@@ -40,7 +40,10 @@ import { liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
   Layer.provide(
-    Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+    Layer.mock(DelegationPlacement.DelegationPlacement)({
+      check: () => Effect.undefined,
+      pinWorkspace: () => Effect.undefined,
+    }),
   ),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),

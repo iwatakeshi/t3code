@@ -118,7 +118,10 @@ const layerLaunches = Layer.effect(
 const layerTools = Layer.mergeAll(
   McpHttpServer.layerOrchestratorToolkit.pipe(
     Layer.provide(
-      Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+      Layer.mock(DelegationPlacement.DelegationPlacement)({
+        check: () => Effect.undefined,
+        pinWorkspace: () => Effect.undefined,
+      }),
     ),
   ),
   McpHttpServer.layerThreadToolkit,

@@ -13,6 +13,10 @@ import { VcsDriverKind } from "./vcs.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const GitFilePath = Schema.String.check(Schema.isNonEmpty());
+export const GitCommitSha = TrimmedNonEmptyString.check(
+  Schema.isPattern(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i),
+);
+export const isGitCommitSha = Schema.is(GitCommitSha);
 const GIT_LIST_BRANCHES_MAX_LIMIT = 200;
 
 export const GitStackedAction = Schema.Literals([

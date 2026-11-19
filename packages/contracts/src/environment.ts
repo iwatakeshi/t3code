@@ -223,6 +223,7 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   /** Publishes a pull request refresh when linked-thread answers change; older servers need polling. */
   linkedThreadRefreshes: Schema.optionalKey(Schema.Boolean),
   executionOsRequirements: Schema.optionalKey(Schema.Boolean),
+  delegatedWorktrees: Schema.optionalKey(Schema.Boolean),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

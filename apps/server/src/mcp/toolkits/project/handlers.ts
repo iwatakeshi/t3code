@@ -166,6 +166,12 @@ const access = Effect.gen(function* () {
   return yield* Project.ProjectService;
 });
 export const layer = McpToolAccess.toLayer(ProjectToolkit, {
+  t3_project_check_commit: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      return { available: yield* launches.checkCommit(input).pipe(Effect.mapError(unavailable)) };
+    }),
+  ),
   t3_thread_launch: McpToolAccess.startsThreads(
     (input) => input,
     (input, { runtimeMode, interactionMode, linkOrigin }) =>

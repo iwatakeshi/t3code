@@ -32,6 +32,7 @@ export const PeerLinkSummary = Schema.Struct({
   status: PeerLinkStatus,
   platform: Schema.optional(ExecutionEnvironmentPlatform),
   executionOsRequirements: Schema.optional(Schema.Boolean),
+  delegatedWorktrees: Schema.optional(Schema.Boolean),
 });
 export type PeerLinkSummary = typeof PeerLinkSummary.Type;
 

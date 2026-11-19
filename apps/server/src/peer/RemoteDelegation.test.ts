@@ -78,7 +78,11 @@ import * as PeerLinkRequests from "./PeerLinkRequests.ts";
 // would for a local child.
 
 const laptop = descriptorOf("environment-laptop", "Laptop");
-const box = descriptorOf("environment-box", "Box", { executionOsRequirements: true });
+const box = descriptorOf("environment-box", "Box", {
+  executionOsRequirements: true,
+  delegatedWorktrees: true,
+});
+const parentCommit = "a".repeat(40);
 const boxProject = ProjectId.make("project:box");
 const instanceId = ProviderInstanceId.make("codex");
 const driver = ProviderDriverKind.make("codex");
@@ -86,11 +90,12 @@ const modelSelection = { instanceId, model: "gpt-5.4" };
 
 type LaunchedWith = Pick<
   ThreadLaunch.ThreadLaunchInput,
-  "modelSelection" | "runtimeMode" | "interactionMode" | "requirements"
+  "modelSelection" | "runtimeMode" | "interactionMode" | "requirements" | "workspaceStrategy"
 >;
 
 /** The thread the box launches for the task, which the test finishes. */
 interface BoxThread {
+  readonly hasCommit: Ref.Ref<boolean>;
   readonly launched: Ref.Ref<ThreadId | null>;
   /** The link session that launched it, as the box stamps it. */
   readonly linkOrigin: Ref.Ref<{ readonly sessionId: string; readonly label: string } | null>;
@@ -147,6 +152,7 @@ interface BoxThread {
 
 const makeBoxThread = Effect.gen(function* () {
   return {
+    hasCommit: yield* Ref.make(true),
     launched: yield* Ref.make<ThreadId | null>(null),
     linkOrigin: yield* Ref.make<{ readonly sessionId: string; readonly label: string } | null>(
       null,
@@ -505,6 +511,11 @@ const boxToolkitLayer = (thread: BoxThread) => {
       ),
   });
   const layerBoxLaunches = Layer.mock(ThreadLaunch.ThreadLaunchService)({
+    checkWorktreeBase: () => Effect.void,
+    checkCommit: ({ commitSha }) =>
+      Effect.succeed(commitSha === parentCommit).pipe(
+        Effect.flatMap((matches) => (matches ? Ref.get(thread.hasCommit) : Effect.succeed(false))),
+      ),
     launch: (input) =>
       Ref.get(thread.runless).pipe(
         Effect.flatMap((runless) =>
@@ -518,6 +529,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
                 runtimeMode: input.runtimeMode,
                 interactionMode: input.interactionMode,
                 ...(input.requirements === undefined ? {} : { requirements: input.requirements }),
+                workspaceStrategy: input.workspaceStrategy,
               }),
             ),
             Effect.andThen(Effect.flatten(Ref.get(thread.afterLaunch))),
@@ -572,7 +584,10 @@ const boxToolkitLayer = (thread: BoxThread) => {
     Layer.provide(
       Layer.merge(
         Layer.mock(RemoteDelegation.RemoteDelegation)({}),
-        Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+        Layer.mock(DelegationPlacement.DelegationPlacement)({
+          check: () => Effect.undefined,
+          pinWorkspace: () => Effect.undefined,
+        }),
       ),
     ),
     Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
@@ -742,6 +757,11 @@ const makeLaptop = (
       Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
       Layer.provide(
         DelegationPlacement.layer.pipe(
+          Layer.provide(
+            Layer.mock(GitVcsDriver.GitVcsDriver)({
+              resolveCommit: () => Effect.succeed({ commitSha: parentCommit }),
+            }),
+          ),
           Layer.provide(PeerForwarding.layer),
           Layer.provide(Layer.succeedContext(database)),
           Layer.provide(Layer.mock(HostResources.HostResources)({})),
@@ -968,68 +988,78 @@ const taskResult = (laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>, ta
       ),
     );
 
-it.effect("Auto placement delegates through the peer transport and returns the result", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const thread = yield* makeBoxThread;
-      const b = yield* serveBox(thread);
-      const offers = yield* SubscriptionRef.make<
-        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
-      >([]);
-      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
-      const a = yield* makeLaptop(database, offers);
-      yield* linkTo(a.links, b, "full-access");
-      yield* seedParent(a);
-      const input = {
-        task: "Review the repository on available compute.",
-        placement: "auto",
-        requirements: { os: ["linux"] },
-        target: { driverKind: boxClaude.driver, model: "claude-sonnet-4-6" },
-        clientRequestId: "auto-review",
-      };
-      const discovery = yield* a.call("t3_environment_links", {});
-      expect(discovery.structuredContent).toMatchObject({
-        links: [
-          {
-            environmentId: box.environmentId,
-            platform: { os: "linux", arch: "x64" },
-            executionOsRequirements: true,
-          },
-        ],
-      });
-      const result = yield* a.call("delegate_task", input);
-      expect(result.isError, JSON.stringify(result.content)).toBe(false);
-      const delegated = result.structuredContent as {
-        taskId: NodeId;
-        remoteChild: { environmentId: string; threadId: ThreadId };
-      };
-      expect(delegated.remoteChild.environmentId).toBe(box.environmentId);
-      expect(result.structuredContent).toMatchObject({
-        environment: { environmentId: box.environmentId, platform: { os: "linux", arch: "x64" } },
-      });
-      expect(yield* Ref.get(thread.launchedWith)).toMatchObject({
-        modelSelection: { instanceId: boxClaude.instanceId, model: "claude-sonnet-4-6" },
-        requirements: { os: ["linux"] },
-      });
-      const retried = yield* a.call("delegate_task", input);
-      expect(retried.structuredContent).toMatchObject({ taskId: delegated.taskId });
-      const conflict = yield* a.call("delegate_task", {
-        ...input,
-        requirements: { os: ["darwin"] },
-      });
-      expect(conflict.isError).toBe(true);
-      expect(conflict.content).toMatchObject([
-        { text: expect.stringContaining("request_conflict") },
-      ]);
-      yield* Ref.set(thread.reply, "Review complete on the worker.");
-      yield* Ref.set(thread.status, "completed");
-      yield* Deferred.succeed(thread.finished, undefined);
-      expect(yield* taskResult(a, delegated.taskId)).toMatchObject({
-        status: "completed",
-        result: "Review complete on the worker.",
-      });
-    }),
-  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+it.effect.each(["shared", "worktree"] as const)(
+  "Auto placement delegates with %s isolation and returns the result",
+  (isolation) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const a = yield* makeLaptop(database, offers);
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const input = {
+          task: "Review the repository on available compute.",
+          placement: "auto",
+          isolation,
+          requirements: { os: ["linux"] },
+          target: { driverKind: boxClaude.driver, model: "claude-sonnet-4-6" },
+          clientRequestId: "auto-review",
+        };
+        const discovery = yield* a.call("t3_environment_links", {});
+        expect(discovery.structuredContent).toMatchObject({
+          links: [
+            {
+              environmentId: box.environmentId,
+              platform: { os: "linux", arch: "x64" },
+              executionOsRequirements: true,
+            },
+          ],
+        });
+        const result = yield* a.call("delegate_task", input);
+        expect(result.isError, JSON.stringify(result.content)).toBe(false);
+        const delegated = result.structuredContent as {
+          taskId: NodeId;
+          remoteChild: { environmentId: string; threadId: ThreadId };
+        };
+        expect(delegated.remoteChild.environmentId).toBe(box.environmentId);
+        expect((result.structuredContent as { baseCommit?: string }).baseCommit).toBe(
+          isolation === "worktree" ? parentCommit : undefined,
+        );
+        expect(result.structuredContent).toMatchObject({
+          environment: { environmentId: box.environmentId, platform: { os: "linux", arch: "x64" } },
+        });
+        expect(yield* Ref.get(thread.launchedWith)).toMatchObject({
+          modelSelection: { instanceId: boxClaude.instanceId, model: "claude-sonnet-4-6" },
+          requirements: { os: ["linux"] },
+          workspaceStrategy:
+            isolation === "worktree"
+              ? { type: "worktree", baseRef: parentCommit, startFromOrigin: false }
+              : { type: "root" },
+        });
+        const retried = yield* a.call("delegate_task", input);
+        expect(retried.structuredContent).toMatchObject({ taskId: delegated.taskId });
+        const conflict = yield* a.call("delegate_task", {
+          ...input,
+          requirements: { os: ["darwin"] },
+        });
+        expect(conflict.isError).toBe(true);
+        expect(conflict.content).toMatchObject([
+          { text: expect.stringContaining("request_conflict") },
+        ]);
+        yield* Ref.set(thread.reply, "Review complete on the worker.");
+        yield* Ref.set(thread.status, "completed");
+        yield* Deferred.succeed(thread.finished, undefined);
+        expect(yield* taskResult(a, delegated.taskId)).toMatchObject({
+          status: "completed",
+          result: "Review complete on the worker.",
+        });
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect("a task delegated to the box wakes the laptop's parent when it ends there", () =>
@@ -1357,6 +1387,7 @@ it.effect("a task named only by environment inherits the parent's model, within 
         modelSelection: parentModelSelection,
         runtimeMode: "auto-accept-edits",
         interactionMode: "default",
+        workspaceStrategy: { type: "root" },
       });
 
       // Asking for more than the link allows is still refused there.
@@ -1400,7 +1431,7 @@ it.effect("a task naming another driver there never runs its model on the parent
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("refuses worktree isolation for a task there before launching anything", () =>
+it.effect("a missing remote commit starts nothing and can be retried after transfer", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const thread = yield* makeBoxThread;
@@ -1412,15 +1443,35 @@ it.effect("refuses worktree isolation for a task there before launching anything
       const a = yield* makeLaptop(database, offers);
       yield* linkTo(a.links, b, "auto");
       yield* seedParent(a);
-
-      const result = yield* a.call("delegate_task", {
+      yield* Ref.set(thread.hasCommit, false);
+      const input = {
         task: "Run the suite on the box.",
-        target: { environmentId: box.environmentId },
+        target: {
+          environmentId: box.environmentId,
+          driverKind: boxClaude.driver,
+          model: "claude-sonnet-4-6",
+        },
         isolation: "worktree",
-      });
+        clientRequestId: "isolated-on-box",
+      };
+      const result = yield* a.call("delegate_task", input);
       expect(result.isError).toBe(true);
-      expect(JSON.stringify(result.content)).toContain("isolation");
+      expect(JSON.stringify(result.content)).toContain("base_unavailable");
       expect(yield* Ref.get(thread.launched)).toBeNull();
+      yield* Ref.set(thread.hasCommit, true);
+      const retried = yield* a.call("delegate_task", input);
+      expect(retried.isError, JSON.stringify(retried.content)).toBe(false);
+      expect(yield* Ref.get(thread.launchedWith)).toMatchObject({
+        workspaceStrategy: { type: "worktree", baseRef: parentCommit, startFromOrigin: false },
+      });
+      const delegated = retried.structuredContent as { taskId: NodeId };
+      yield* Ref.set(thread.reply, "Isolated work complete.");
+      yield* Ref.set(thread.status, "completed");
+      yield* Deferred.succeed(thread.finished, undefined);
+      expect(yield* taskResult(a, delegated.taskId)).toMatchObject({
+        status: "completed",
+        result: "Isolated work complete.",
+      });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

@@ -78,7 +78,10 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(PullRequestReviewGuideService)({}),
   Layer.mock(PullRequestService)({}),
   Layer.mock(RemoteDelegation)({}),
-  Layer.mock(DelegationPlacement)({ check: () => Effect.undefined }),
+  Layer.mock(DelegationPlacement)({
+    check: () => Effect.undefined,
+    pinWorkspace: () => Effect.undefined,
+  }),
   Layer.mock(HostResources)({}),
   Layer.mock(ScheduledTaskService)({}),
   Layer.mock(SecretRequests)({}),

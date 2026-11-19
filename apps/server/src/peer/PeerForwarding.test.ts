@@ -222,7 +222,10 @@ const serveBox = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) =>
     Layer.mergeAll(
       McpHttpServer.layerOrchestratorToolkit.pipe(
         Layer.provide(
-          Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+          Layer.mock(DelegationPlacement.DelegationPlacement)({
+            check: () => Effect.undefined,
+            pinWorkspace: () => Effect.undefined,
+          }),
         ),
       ),
       McpHttpServer.layerProjectRegistration,
@@ -281,7 +284,10 @@ const makeLaptop = Effect.gen(function* () {
   const layerHere = Layer.mergeAll(
     McpHttpServer.layerOrchestratorToolkit.pipe(
       Layer.provide(
-        Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+        Layer.mock(DelegationPlacement.DelegationPlacement)({
+          check: () => Effect.undefined,
+          pinWorkspace: () => Effect.undefined,
+        }),
       ),
     ),
     McpHttpServer.layerProjectRegistration,

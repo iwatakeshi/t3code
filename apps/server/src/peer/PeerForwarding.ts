@@ -276,6 +276,9 @@ const make = Effect.gen(function* () {
           ...(link.executionOsRequirements === undefined
             ? {}
             : { executionOsRequirements: link.executionOsRequirements }),
+          ...(link.delegatedWorktrees === undefined
+            ? {}
+            : { delegatedWorktrees: link.delegatedWorktrees }),
         })),
         notListed: NOT_LISTED,
       };

@@ -604,6 +604,7 @@ const make = Effect.gen(function* () {
       status: "reachable",
       platform: answered.value.platform,
       executionOsRequirements: answered.value.capabilities.executionOsRequirements === true,
+      delegatedWorktrees: answered.value.capabilities.delegatedWorktrees === true,
     };
   });
 

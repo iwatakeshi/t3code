@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  GitCommandError,
   type HostResourcesSnapshot,
   type OrchestratorMcpEnvironmentLink,
   type OrchestratorMcpProviderCapability,
@@ -24,6 +25,7 @@ import * as HostResources from "../resourceTelemetry/HostResources.ts";
 import * as DelegationPlacement from "./DelegationPlacement.ts";
 import * as PeerForwarding from "./PeerForwarding.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 
 const here = EnvironmentId.make("local");
 const there = EnvironmentId.make("remote");
@@ -32,6 +34,7 @@ const remoteProject = ProjectId.make("remote-project");
 const instanceId = ProviderInstanceId.make("codex");
 const remoteInstance = ProviderInstanceId.make("codex-remote");
 const driverKind = ProviderDriverKind.make("codex");
+const baseCommit = "a".repeat(40);
 const parent = { projectId, modelSelection: { instanceId, model: "test-model" }, driverKind };
 const scope: McpInvocationContext.McpThreadInvocationScope = {
   environmentId: here,
@@ -70,6 +73,7 @@ const link: OrchestratorMcpEnvironmentLink = {
   lastError: null,
   platform: { os: "linux", arch: "x64" },
   executionOsRequirements: true,
+  delegatedWorktrees: true,
 };
 
 const setup = Effect.gen(function* () {
@@ -80,10 +84,34 @@ const setup = Effect.gen(function* () {
     providers: [provider] as ReadonlyArray<OrchestratorMcpProviderCapability>,
     repositories: [remoteProject] as ReadonlyArray<ProjectId>,
     supportsResources: true,
+    head: baseCommit,
+    localCommits: [baseCommit] as ReadonlyArray<string>,
+    remoteCommits: [baseCommit] as ReadonlyArray<string>,
   });
+  const gitReads = yield* Ref.make<
+    ReadonlyArray<{ readonly cwd: string; readonly revision: string }>
+  >([]);
   const calls = yield* Ref.make<ReadonlyArray<string>>([]);
   const database = yield* Sqlite.layerMemory.pipe(Layer.build);
   const dependencies = Layer.mergeAll(
+    Layer.mock(GitVcsDriver.GitVcsDriver)({
+      resolveCommit: (input) =>
+        Ref.update(gitReads, (seen) => [...seen, input]).pipe(
+          Effect.andThen(Ref.get(state)),
+          Effect.flatMap((s) =>
+            input.revision === "HEAD" || s.localCommits.includes(input.revision)
+              ? Effect.succeed({ commitSha: input.revision === "HEAD" ? s.head : input.revision })
+              : Effect.fail(
+                  new GitCommandError({
+                    operation: "resolveCommit",
+                    command: "git",
+                    cwd: input.cwd,
+                    detail: "Commit unavailable",
+                  }),
+                ),
+          ),
+        ),
+    }),
     Layer.mock(ServerEnvironment.ServerEnvironment)({
       getDescriptor: Effect.succeed({
         environmentId: here,
@@ -112,6 +140,12 @@ const setup = Effect.gen(function* () {
         Effect.gen(function* () {
           yield* Ref.update(calls, (seen) => [...seen, tool.name]);
           const current = yield* Ref.get(state);
+          if (tool.name === "t3_project_check_commit")
+            return {
+              available: current.remoteCommits.includes(
+                (params as { commitSha: string }).commitSha,
+              ),
+            } as never;
           let result: unknown;
           if (tool.name === "t3_project_list") {
             result = {
@@ -148,6 +182,7 @@ const setup = Effect.gen(function* () {
   const context = yield* build;
   return {
     state,
+    gitReads,
     calls,
     service: yield* DelegationPlacement.DelegationPlacement.pipe(Effect.provide(context)),
     rebuild: build.pipe(
@@ -219,22 +254,111 @@ it.effect("fails without launching or pinning when no machine qualifies", () =>
   }),
 );
 
+it.effect("rejects explicit destinations and unpinned worktree isolation", () =>
+  Effect.gen(function* () {
+    const { service, calls } = yield* setup;
+    for (const input of [
+      { target: { environmentId: there } },
+      { target: { projectId: remoteProject } },
+      { isolation: "worktree" as const },
+    ]) {
+      const error = yield* service
+        .select(scope, { task: "Checks", clientRequestId: "invalid", ...input }, parent, {})
+        .pipe(Effect.flip);
+      expect(error.code).toBe("invalid_request");
+    }
+    expect(yield* Ref.get(calls)).toEqual([]);
+  }),
+);
+
+it.effect("pins the parent checkout commit across restarts and rejects isolation changes", () =>
+  Effect.gen(function* () {
+    const { service, state, rebuild, gitReads } = yield* setup;
+    const input = {
+      task: "Implement",
+      clientRequestId: "pinned-base",
+      isolation: "worktree" as const,
+    };
+    const parentCheckout = { projectId, worktreePath: "/workspace/feature" };
+    const first = yield* service.pinWorkspace(scope, input, parentCheckout);
+    expect(first).toEqual({ projectId, commitSha: baseCommit });
+    expect(yield* Ref.get(gitReads)).toEqual([
+      { cwd: parentCheckout.worktreePath, revision: "HEAD" },
+    ]);
+    yield* Ref.update(state, (s) => ({ ...s, head: "b".repeat(40) }));
+    const restarted = yield* rebuild;
+    expect(yield* restarted.pinWorkspace(scope, input, parentCheckout)).toEqual(first);
+    expect(yield* Ref.get(gitReads)).toHaveLength(1);
+    const changed = yield* restarted
+      .pinWorkspace(scope, { ...input, isolation: "shared" }, parentCheckout)
+      .pipe(Effect.flip);
+    expect(changed.code).toBe("request_conflict");
+  }),
+);
+
+it.effect("Auto considers only workers that already have the pinned commit", () =>
+  Effect.gen(function* () {
+    const { service, state, sql } = yield* setup;
+    const input = {
+      task: "Implement",
+      clientRequestId: "eligible-base",
+      isolation: "worktree" as const,
+    };
+    const workspace = yield* service.pinWorkspace(scope, input, {
+      projectId,
+      worktreePath: "/workspace/feature",
+    });
+    yield* Ref.update(state, (s) => ({
+      ...s,
+      local: { ...snapshot, cpuUtilization: 0 },
+      localCommits: [],
+    }));
+    const chosen = yield* service.select(scope, input, parent, {}, workspace);
+    expect(chosen.environmentId).toBe(there);
+    const other = { ...input, clientRequestId: "unavailable-base" };
+    const otherWorkspace = yield* service.pinWorkspace(scope, other, {
+      projectId,
+      worktreePath: "/workspace/feature",
+    });
+    yield* Ref.update(state, (s) => ({ ...s, remoteCommits: [] }));
+    const unavailable = yield* service
+      .select(scope, other, parent, {}, otherWorkspace)
+      .pipe(Effect.flip);
+    expect(unavailable.code).toBe("no_compatible_environment");
+    expect(unavailable.message).toContain(baseCommit);
+    const pending = yield* sql<{
+      target_json: string;
+    }>`SELECT target_json FROM delegated_task_placements WHERE client_request_id = ${other.clientRequestId}`;
+    expect(pending[0]?.target_json).toBe("{}");
+  }),
+);
+
 it.effect(
-  "rejects explicit destinations and worktree isolation instead of changing their meaning",
+  "explicit isolation waits for commit transfer and never substitutes the worker's HEAD",
   () =>
     Effect.gen(function* () {
-      const { service, calls } = yield* setup;
-      for (const input of [
-        { target: { environmentId: there } },
-        { target: { projectId: remoteProject } },
-        { isolation: "worktree" as const },
-      ]) {
-        const error = yield* service
-          .select(scope, { task: "Checks", clientRequestId: "invalid", ...input }, parent, {})
-          .pipe(Effect.flip);
-        expect(error.code).toBe("invalid_request");
-      }
-      expect(yield* Ref.get(calls)).toEqual([]);
+      const { service, state } = yield* setup;
+      const input = {
+        task: "Implement",
+        clientRequestId: "transfer-base",
+        isolation: "worktree" as const,
+        target: { environmentId: there, projectId: remoteProject },
+      };
+      const workspace = yield* service.pinWorkspace(scope, input, {
+        projectId,
+        worktreePath: null,
+      });
+      yield* Ref.update(state, (s) => ({ ...s, head: "b".repeat(40), remoteCommits: [] }));
+      const missing = yield* service.check(scope, input, workspace).pipe(Effect.flip);
+      expect(missing.code).toBe("base_unavailable");
+      yield* Ref.update(state, (s) => ({ ...s, remoteCommits: [baseCommit] }));
+      expect(yield* service.pinWorkspace(scope, input, { projectId, worktreePath: null })).toEqual(
+        workspace,
+      );
+      expect(yield* service.check(scope, input, workspace)).toMatchObject({ environmentId: there });
+      yield* Ref.update(state, (s) => ({ ...s, links: [{ ...link, delegatedWorktrees: false }] }));
+      const old = yield* service.check(scope, input, workspace).pipe(Effect.flip);
+      expect(old.code).toBe("capability_denied");
     }),
 );
 

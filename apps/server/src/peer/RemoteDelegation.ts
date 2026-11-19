@@ -88,9 +88,16 @@ const RemoteCapabilitiesTool = Tool.make("orchestrator_capabilities", {
 export class RemoteDelegation extends Context.Service<
   RemoteDelegation,
   {
+    readonly resolveProject: (
+      scope: ThreadScope,
+      environmentId: EnvironmentId,
+      parentProjectId: ProjectId,
+      requested: ProjectId | undefined,
+    ) => Effect.Effect<ProjectId, OrchestratorMcpFailure>;
     readonly delegate: (
       scope: ThreadScope,
       input: OrchestratorMcpDelegateTaskInput & {
+        readonly baseCommit?: string;
         readonly target: NonNullable<OrchestratorMcpDelegateTaskInput["target"]> & {
           readonly environmentId: EnvironmentId;
         };
@@ -288,13 +295,10 @@ const make = Effect.gen(function* () {
       }
       const parentNodeId = parentRun.rootNodeId;
       const { target } = input;
-      // A worktree there would branch from a commit this checkout has and the
-      // other may not, so a remote task runs in that project's checkout.
-      if (input.isolation === "worktree") {
+      if (input.isolation === "worktree" && input.baseCommit === undefined) {
         return yield* new OrchestratorMcpFailure({
           code: "invalid_request",
-          message:
-            'A task in a linked environment runs in that project\'s checkout; isolation "worktree" is not supported there. Omit isolation, or use t3_thread_launch with environmentId and a worktree workspaceStrategy.',
+          message: "Worktree isolation requires the parent's pinned commit.",
         });
       }
       // The provider and model inherit as they do for a task here. Another
@@ -351,6 +355,15 @@ const make = Effect.gen(function* () {
         {
           projectId,
           title,
+          ...(input.isolation !== "worktree" || input.baseCommit === undefined
+            ? {}
+            : {
+                workspaceStrategy: {
+                  type: "worktree" as const,
+                  baseRef: input.baseCommit,
+                  startFromOrigin: false,
+                },
+              }),
           ...(input.requirements === undefined ? {} : { requirements: input.requirements }),
           modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
           ...(runtimeMode === undefined ? {} : { runtimeMode }),
@@ -1035,7 +1048,14 @@ const make = Effect.gen(function* () {
       }).pipe(Effect.ignoreCause({ log: true })),
     );
 
-  return RemoteDelegation.of({ delegate, followUp, cancel, runStatus, start });
+  return RemoteDelegation.of({
+    delegate,
+    followUp,
+    cancel,
+    runStatus,
+    start,
+    resolveProject: resolveRemoteProject,
+  });
 });
 
 /** A defect, logged, as a failure, so a retry covers it. */

@@ -2680,6 +2680,15 @@ const make = Effect.gen(function* () {
       yield* requireCapability(callerScope);
       const delegationKey = yield* requestKey(input.clientRequestId);
       input = { ...input, clientRequestId: delegationKey };
+      const workspaceParent =
+        input.isolation === "worktree"
+          ? (yield* loadThreadCaller(callerScope, "delegate_task")).parent.thread
+          : undefined;
+      const workspace = yield* delegationPlacement.pinWorkspace(
+        yield* requireThreadScope(callerScope, "delegate_task"),
+        { ...input, clientRequestId: delegationKey },
+        workspaceParent,
+      );
       if (input.placement === "auto") {
         const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
         const providers = yield* loadProviders;
@@ -2724,15 +2733,37 @@ const make = Effect.gen(function* () {
                 providerInstanceId: resolved.modelSelection.instanceId,
                 model: resolved.modelSelection.model,
               },
+          workspace,
         );
         input = { ...input, placement: undefined, clientRequestId, target };
+      }
+      const requestedEnvironment = PeerForwarding.remoteTarget(
+        callerScope,
+        input.target?.environmentId,
+      );
+      if (
+        workspace !== undefined &&
+        requestedEnvironment !== undefined &&
+        input.target?.projectId === undefined
+      ) {
+        const projectId = yield* remoteDelegation.resolveProject(
+          yield* requireThreadScope(callerScope, "delegate_task"),
+          requestedEnvironment,
+          workspace.projectId,
+          undefined,
+        );
+        input = { ...input, target: { ...input.target, projectId } };
       }
       const execution = yield* delegationPlacement.check(
         yield* requireThreadScope(callerScope, "delegate_task"),
         { ...input, clientRequestId: delegationKey },
+        workspace,
       );
-      const withEnvironment = (result: OrchestratorMcpDelegateTaskResult) =>
-        execution === undefined ? result : { ...result, environment: execution };
+      const withEnvironment = (result: OrchestratorMcpDelegateTaskResult) => ({
+        ...result,
+        ...(execution === undefined ? {} : { environment: execution }),
+        ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
+      });
       const environmentId =
         input.target === undefined
           ? undefined
@@ -2744,6 +2775,7 @@ const make = Effect.gen(function* () {
         const { taskId } = yield* remoteDelegation.delegate(scope, {
           ...input,
           target: { ...input.target, environmentId },
+          ...(workspace === undefined ? {} : { baseCommit: workspace.commitSha }),
         });
         return withEnvironment(
           yield* input.mode === "wait"
@@ -2797,36 +2829,10 @@ const make = Effect.gen(function* () {
         parent.thread.interactionMode,
         input.interactionMode,
       );
-      let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
-      if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
-        const project = yield* requireProject(parent.thread.projectId);
-        const base = yield* gitDriver
-          .resolveCommit({
-            cwd: parent.thread.worktreePath ?? project.workspaceRoot,
-            revision: "HEAD",
-          })
-          .pipe(
-            Effect.mapError(() =>
-              failure("invalid_request", "Unable to resolve the parent checkout commit."),
-            ),
-          );
-        // Launch preparation creates the worktree from the project root, so a
-        // parent checkout in another repository (such as a Git folder inside
-        // Scratch) would hand it a commit it cannot find.
-        if (parent.thread.worktreePath !== null) {
-          yield* gitDriver
-            .resolveCommit({ cwd: project.workspaceRoot, revision: base.commitSha })
-            .pipe(
-              Effect.mapError(() =>
-                failure(
-                  "invalid_request",
-                  `Isolation "worktree" creates the child checkout in project "${project.title}" (${project.workspaceRoot}), which does not contain the parent checkout's commit. Use isolation "shared" to work in the parent's checkout.`,
-                ),
-              ),
-            );
-        }
-        workspaceStrategy = { type: "worktree", baseRef: base.commitSha, startFromOrigin: false };
-      }
+      const workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined =
+        workspace === undefined
+          ? undefined
+          : { type: "worktree", baseRef: workspace.commitSha, startFromOrigin: false };
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.

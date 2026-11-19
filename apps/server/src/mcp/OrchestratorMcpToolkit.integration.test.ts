@@ -59,7 +59,10 @@ import * as PeerLinks from "../peer/PeerLinks.ts";
 
 const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
   Layer.provide(
-    Layer.mock(DelegationPlacement.DelegationPlacement)({ check: () => Effect.undefined }),
+    Layer.mock(DelegationPlacement.DelegationPlacement)({
+      check: () => Effect.undefined,
+      pinWorkspace: () => Effect.undefined,
+    }),
   ),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
