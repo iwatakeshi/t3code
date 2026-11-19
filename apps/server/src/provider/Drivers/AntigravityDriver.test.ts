@@ -79,6 +79,12 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
   const requestLog = path.join(root, "requests.jsonl");
   const directories = yield* resolveAntigravityInstanceDirectories(config.stateDir, instanceId);
   const profileDirectory = directories.profile;
+  // Quota probes must not consult the developer's keyring or contact Google.
+  yield* fs.makeDirectory(path.join(profileDirectory, "antigravity-acp"), { recursive: true });
+  yield* fs.writeFileString(
+    path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token"),
+    JSON.stringify({ token: { access_token: "fixture", expiry: "1970-01-01T00:00:00Z" } }),
+  );
   const instancePath = `${path.join(root, "instance-bin")}:${baseEnv.PATH ?? ""}`;
 
   const makeExecutable = Effect.fn("AntigravityDriverTest.makeExecutable")(function* (

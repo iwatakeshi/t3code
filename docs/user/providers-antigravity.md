@@ -169,6 +169,10 @@ Open **Usage > Limits** to see the remaining Gemini and shared Claude/GPT allowa
 for Google sign-ins. Each group has separate five-hour and weekly limits and reset
 times. Limits refresh with provider status and include usage outside T3 Code.
 
+With the native CLI, limits use its saved Google sign-in. Your operating system
+may ask for keyring access. If the saved access token has expired, limits update
+after an Antigravity session refreshes it.
+
 A server restart keeps your Google sign-in. The provider shows the saved account
 until a session, a refresh, or a sign-out reports something new.
 

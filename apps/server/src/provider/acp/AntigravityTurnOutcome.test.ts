@@ -30,9 +30,44 @@ const QUOTA_ERROR = errorPayload(
 const RATE_LIMIT_ERROR = errorPayload(
   "Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED, Details: [map[@type:type.googleapis.com/google.rpc.ErrorInfo domain:cloudcode-pa.googleapis.com reason:RATE_LIMIT_EXCEEDED] map[@type:type.googleapis.com/google.rpc.RetryInfo retryDelay:42s]]",
 );
+// Antigravity 1.5 writes "STATUS (code NNN): message", protobuf bytes, then Google's JSON body.
+const JSON_QUOTA_ERROR = Buffer.concat([
+  Buffer.from([0x12, 0x86, 0x01]),
+  Buffer.from(
+    "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h24m51s.\u001a«\tHTTP 429 Too Many Requests\n\n" +
+      JSON.stringify(
+        {
+          error: {
+            code: 429,
+            details: [
+              {
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                metadata: {
+                  quotaResetDelay: "2h24m51.361888584s",
+                  quotaResetTimeStamp: "2026-11-19T18:33:55Z",
+                },
+                reason: "QUOTA_EXHAUSTED",
+              },
+              { "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "8691.36s" },
+            ],
+            status: "RESOURCE_EXHAUSTED",
+          },
+        },
+        null,
+        2,
+      ),
+  ),
+]);
 const INVALID_ARGUMENT_ERROR = errorPayload(
   "Error 400, Message: Request contains an invalid argument., Status: INVALID_ARGUMENT, Details: []",
 );
+// The harness renders a gateway failure with its HTTP status line in place of a gRPC status.
+const BAD_GATEWAY_ERROR = Buffer.concat([
+  errorPayload(
+    "Error 502, Message: Bad Gateway: Failed to connect to backend API, Status: 502 Bad Gateway, Details: []",
+  ),
+  Buffer.from("\nThe model is currently unreachable."),
+]);
 // Vertex Claude rejects a resumed history whose saved thinking block lost its signature.
 const MISSING_SIGNATURE_ERROR = errorPayload(
   'Error 400, Message: {"type":"error","error":{"type":"invalid_request_error","message":"messages.1.content.0.thinking.signature: Field required"},"request_id":"req_vrtx_test"}, Status: INVALID_ARGUMENT, Details: []',
@@ -130,6 +165,31 @@ describe("watchAntigravityPromptOutcome", () => {
       assert.deepEqual(
         yield* turn([
           [USER_INPUT, input],
+          [ERROR_MESSAGE, errorPayload("NOT_FOUND (code 404): Requested entity was not found.")],
+        ]),
+        reusable({
+          class: "provider_error",
+          message: "Requested entity was not found.",
+          code: "NOT_FOUND",
+          retryable: false,
+        }),
+      );
+      assert.deepEqual(
+        yield* turn([
+          [USER_INPUT, input],
+          [ERROR_MESSAGE, JSON_QUOTA_ERROR],
+        ]),
+        reusable({
+          class: "usage_limit",
+          message: "You have reached your Antigravity quota for this period.",
+          code: "RESOURCE_EXHAUSTED",
+          retryable: true,
+          resetAt: "2026-11-19T18:33:55.000Z",
+        }),
+      );
+      assert.deepEqual(
+        yield* turn([
+          [USER_INPUT, input],
           [ERROR_MESSAGE, INVALID_ARGUMENT_ERROR],
         ]),
         reusable({
@@ -138,6 +198,17 @@ describe("watchAntigravityPromptOutcome", () => {
           code: "INVALID_ARGUMENT",
           retryable: false,
         }),
+      );
+      assert.deepInclude(
+        (yield* turn([
+          [USER_INPUT, input],
+          [ERROR_MESSAGE, BAD_GATEWAY_ERROR],
+        ]))?.failure,
+        {
+          class: "provider_error",
+          message: "Bad Gateway: Failed to connect to backend API",
+          retryable: true,
+        },
       );
       // A saved thinking block without a valid signature fails every later prompt.
       for (const error of [MISSING_SIGNATURE_ERROR, INVALID_SIGNATURE_ERROR]) {
@@ -181,6 +252,48 @@ describe("watchAntigravityPromptOutcome", () => {
         }),
       );
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps only an absolute reset time for a prompt the watchdog retired", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const profileDirectory = yield* fs.makeTempDirectoryScoped();
+      const sessionId = "e6aba774-5472-4277-b6ee-27b2e05570a7";
+      const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+      yield* fs.makeDirectory(conversations, { recursive: true });
+      const retiredTurn = (error: Uint8Array) =>
+        Effect.gen(function* () {
+          const check = yield* watchAntigravityPromptOutcome(profileDirectory, sessionId);
+          const database = new NodeSqlite.DatabaseSync(path.join(conversations, `${sessionId}.db`));
+          try {
+            database.exec(
+              "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB)",
+            );
+            database
+              .prepare("INSERT INTO steps (step_type, step_payload) VALUES (?, ?)")
+              .run(ERROR_MESSAGE, error);
+          } finally {
+            database.close();
+          }
+          return (yield* check({ stopReason: "end_turn" }, { retired: true }))?.failure;
+        });
+
+      assert.deepEqual(yield* retiredTurn(RATE_LIMIT_ERROR), {
+        class: "usage_limit",
+        message: "Resource has been exhausted (e.g. check quota).",
+        code: "RESOURCE_EXHAUSTED",
+        retryable: true,
+      });
+      assert.equal(
+        (yield* retiredTurn(
+          errorPayload(
+            "Error 429, Message: Quota exhausted for test model., Status: RESOURCE_EXHAUSTED, Details: [map[@type:type.googleapis.com/google.rpc.ErrorInfo domain:googleapis.com metadata:map[quotaResetDelay:3600s quotaResetTimeStamp:2026-11-09T01:05:00Z] reason:QUOTA_EXHAUSTED]]",
+          ),
+        ))?.resetAt,
+        "2026-11-09T01:05:00.000Z",
+      );
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
   );
 
   it.effect("reads only this session's own unlinked log, and keeps a typed refusal", () =>

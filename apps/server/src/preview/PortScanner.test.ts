@@ -1035,7 +1035,7 @@ const agentServer = () =>
         "bash",
         [
           "-c",
-          `set -m; ${AGENT_COMMAND_ENV}=command-live "$0" -e "$1" & wait`,
+          `set -m; env '${AGENT_COMMAND_ENV}=command-live' "$0" -e "$1" & wait`,
           process.execPath,
           AGENT_SERVER_SCRIPT,
         ],
