@@ -1,8 +1,6 @@
 import {
   ProviderSetupError,
   type ProviderAuthState,
-  type ProviderAuthInteraction,
-  type ProviderAuthResponse,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -23,6 +21,7 @@ import * as AcpErrors from "effect-acp/errors";
 
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import {
+  antigravityLoginResponse,
   parseAntigravityAuthorizationUrl,
   type AntigravityAuthorizationUrl,
 } from "./antigravityAuthSupport.ts";
@@ -47,18 +46,18 @@ const NO_RESPONSE_MESSAGE =
 const UNREACHABLE_MESSAGE =
   "Antigravity could not reach Google. Check this machine's network connection, then start sign-in again.";
 const FORWARDING_FAILED_MESSAGE = "Could not deliver the sign-in response. Start sign-in again.";
+const LOGIN_CODE_FIELD = "code";
 const isSetupError = Schema.is(ProviderSetupError);
 const isAcpRequestError = Schema.is(AcpErrors.AcpRequestError);
+const isAcpProcessExitedError = Schema.is(AcpErrors.AcpProcessExitedError);
 
 interface AuthSnapshot {
   readonly ownerSessionId: string | null;
   readonly state: ProviderAuthState;
+  readonly codeLogin?: boolean;
 }
 
 interface AuthFlow {
-  respond?:
-    | ((response: ProviderAuthResponse) => Effect.Effect<void, ProviderSetupError>)
-    | undefined;
   readonly id: string;
   readonly ownerSessionId: string;
   readonly expiresAtMillis: number;
@@ -66,6 +65,8 @@ interface AuthFlow {
   pending: AntigravityAuthorizationUrl | undefined;
   initialized: boolean;
   callbackSent: boolean;
+  codeLogin: boolean;
+  submitCode: ((response: string) => Effect.Effect<void>) | undefined;
   fiber: Fiber.Fiber<void> | undefined;
   forwarding: Fiber.Fiber<void, ProviderSetupError> | undefined;
 }
@@ -81,19 +82,21 @@ export interface AntigravityAuth {
     stop: Effect.Effect<void>,
     task: Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | ProviderSetupError, R | Scope.Scope>;
+  /** A session started outside a flow, so an earlier flow's failure no longer describes sign-in. */
+  readonly onSignedInElsewhere: Effect.Effect<void>;
+}
+
+/** `agy acp --login`: it prints a Google link and reads the code the Antigravity page shows. */
+export interface AntigravityCodeLogin {
+  readonly submit: (response: string) => Effect.Effect<void>;
+  /** Succeeds once the runtime has stored the sign-in. */
+  readonly completed: Effect.Effect<void, ProviderSetupError>;
 }
 
 export type AntigravityAuthRuntime = Pick<
   AcpSessionRuntime.AcpSessionRuntime["Service"],
   "initialize" | "start" | "request"
 >;
-
-export type AntigravityNativeLogin = (
-  publish: (
-    interaction: ProviderAuthInteraction,
-    respond: (response: ProviderAuthResponse) => Effect.Effect<void, ProviderSetupError>,
-  ) => Effect.Effect<void, ProviderSetupError>,
-) => Effect.Effect<void, ProviderSetupError, Scope.Scope>;
 
 export interface AntigravityAuthOptions<
   Runtime extends AntigravityAuthRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"],
@@ -109,7 +112,14 @@ export interface AntigravityAuthOptions<
   readonly onSignedOut: Effect.Effect<void>;
   readonly forwardCallback?: (callback: URL) => Effect.Effect<void, ProviderSetupError>;
   readonly usesBrowser?: boolean;
-  readonly nativeLogin?: AntigravityNativeLogin;
+  /** Undefined when the runtime signs in through ACP `authenticate` and T3's browser helper. */
+  readonly codeLogin?: (input: {
+    readonly onAuthorizationUrl: (url: string) => Effect.Effect<void, AcpErrors.AcpError>;
+  }) => Effect.Effect<
+    AntigravityCodeLogin | undefined,
+    AcpErrors.AcpError | ProviderSetupError,
+    Scope.Scope
+  >;
 }
 
 function visibleSnapshot(snapshot: AuthSnapshot, ownerSessionId: string): ProviderAuthState {
@@ -132,6 +142,16 @@ function safeAuthFailure(cause: Cause.Cause<unknown>, usesBrowser: boolean): str
   if (Option.isSome(error)) {
     if (isSetupError(error.value)) {
       return error.value.detail;
+    }
+    if (isAcpProcessExitedError(error.value)) {
+      const { code, signal } = error.value;
+      const reason =
+        signal !== undefined
+          ? ` after signal ${signal}`
+          : code !== undefined
+            ? ` with code ${code}`
+            : "";
+      return `Antigravity exited unexpectedly${reason}. Start sign-in again.`;
     }
     if (isAcpRequestError(error.value)) {
       if (error.value.errorMessage.includes("SUBSCRIPTION_REQUIRED")) {
@@ -187,7 +207,11 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
     );
   const publishFlow = (flow: AuthFlow, state: ProviderAuthState) => {
     flow.state = state;
-    return SubscriptionRef.set(snapshot, { ownerSessionId: flow.ownerSessionId, state });
+    return SubscriptionRef.set(snapshot, {
+      ownerSessionId: flow.ownerSessionId,
+      state,
+      codeLogin: flow.codeLogin,
+    });
   };
   const stopOwnedProcesses = Effect.suspend(() =>
     Effect.forEach(
@@ -252,7 +276,6 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
           ...flow.state,
           phase: Exit.isSuccess(result) ? "succeeded" : "failed",
           authorizationUrl: null,
-          interaction: null,
           expiresAt: null,
           message: Exit.isSuccess(result)
             ? usesBrowser
@@ -263,8 +286,8 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
       }),
     );
 
-  const receiveAuthorizationUrl = (flow: AuthFlow, url: string) =>
-    parseAntigravityAuthorizationUrl(url).pipe(
+  const receiveAuthorizationUrl = (flow: AuthFlow, url: string, redirect: "loopback" | "code") =>
+    parseAntigravityAuthorizationUrl(url, redirect).pipe(
       Effect.flatMap((authorization) =>
         lock.withPermits(1)(
           Effect.gen(function* () {
@@ -277,12 +300,15 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
               });
             }
             flow.pending = authorization;
+            flow.codeLogin = redirect === "code";
             yield* publishFlow(flow, {
               ...flow.state,
               phase: "waiting",
               authorizationUrl: authorization.authorizationUrl,
               message:
-                "Open the Google sign-in link. If you are remote, paste the redirect URL here.",
+                redirect === "loopback"
+                  ? "Open the Google sign-in link. If you are remote, paste the redirect URL here."
+                  : "Open the Google sign-in link, then paste the code from the Antigravity page here.",
             });
           }),
         ),
@@ -305,24 +331,24 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
   const runSignIn = Effect.fn("AntigravityAuth.runSignIn")(
     function* (flow: AuthFlow, stopSessions: Effect.Effect<void, ProviderSetupError>) {
       yield* stopSessions.pipe(Effect.ensuring(stopOwnedProcesses));
-      if (usesBrowser && options.nativeLogin) {
-        yield* Effect.scoped(
-          options.nativeLogin((interaction, respond) =>
-            lock.withPermits(1)(
-              Effect.gen(function* () {
-                if (activeFlow !== flow) return;
-                flow.respond = respond;
-                yield* publishFlow(flow, { ...flow.state, phase: "waiting", interaction });
-              }),
-            ),
-          ),
-        );
-        flow.respond = undefined;
-        yield* publishFlow(flow, { ...flow.state, phase: "starting", interaction: null });
-      }
-      const runtime = yield* options.makeRuntime({
-        onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url),
-      });
+      const signedIn = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const login = yield* (
+            options.codeLogin?.({
+              onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url, "code"),
+            }) ?? Effect.undefined
+          );
+          if (login === undefined) return false;
+          flow.submitCode = login.submit;
+          yield* login.completed;
+          return true;
+        }),
+      );
+      const runtime = yield* options.makeRuntime(
+        signedIn
+          ? {}
+          : { onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url, "loopback") },
+      );
       const startupHint = yield* publishStartingHint(flow, STARTUP_HINT_MS, NOT_STARTED_MESSAGE);
       // `start` reuses this memoized handshake.
       yield* runtime.initialize();
@@ -378,7 +404,6 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
             yield* publishFlow(flow, {
               ...flow.state,
               phase,
-              interaction: null,
               authorizationUrl: null,
               expiresAt: null,
               message,
@@ -447,6 +472,8 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
               pending: undefined,
               initialized: false,
               callbackSent: false,
+              codeLogin: false,
+              submitCode: undefined,
               fiber: undefined,
               forwarding: undefined,
             };
@@ -461,34 +488,10 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
           }),
         ),
       ),
-    respond: Effect.fn("AntigravityAuth.respond")(function* (ownerSessionId, input) {
-      return yield* lock.withPermits(1)(
-        Effect.gen(function* () {
-          const flow = yield* requireFlow(ownerSessionId, input.flowId, "respond");
-          if (!flow.respond || flow.state.interaction?.id !== input.interactionId) {
-            return yield* setupError("respond", "This sign-in interaction is no longer active.");
-          }
-          yield* flow.respond(input.response);
-          return flow.state;
-        }),
-      );
-    }),
     complete: Effect.fn("AntigravityAuth.complete")(function* (ownerSessionId, input) {
       const pending = yield* lock.withPermits(1)(
         Effect.gen(function* () {
           const flow = yield* requireFlow(ownerSessionId, input.flowId, "complete");
-          if (flow.respond && flow.state.interaction?.type === "browser" && !flow.callbackSent) {
-            yield* flow.respond({ type: "credentials", values: { callback: input.callbackUrl } });
-            flow.callbackSent = true;
-            yield* publishFlow(flow, {
-              ...flow.state,
-              phase: "verifying",
-              interaction: null,
-              authorizationUrl: null,
-              message: "Waiting for Google to finish sign-in.",
-            });
-            return { flow, forwarding: undefined };
-          }
           if (!flow.pending || flow.callbackSent) {
             return yield* setupError(
               "complete",
@@ -526,12 +529,48 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
           return { flow, forwarding };
         }),
       );
-      if (pending.forwarding === undefined) return pending.flow.state;
       const forwarded = yield* Fiber.await(pending.forwarding);
       if (Exit.isFailure(forwarded)) {
         return yield* setupError("complete", FORWARDING_FAILED_MESSAGE);
       }
       return pending.flow.state;
+    }),
+    respond: Effect.fn("AntigravityAuth.respond")(function* (ownerSessionId, input) {
+      return yield* lock.withPermits(1)(
+        Effect.gen(function* () {
+          const flow = yield* requireFlow(ownerSessionId, input.flowId, "respond");
+          if (!flow.pending || !flow.submitCode || flow.callbackSent) {
+            return yield* setupError(
+              "respond",
+              flow.callbackSent
+                ? "The sign-in response was already sent. Wait for Google to finish."
+                : "Wait for the Google sign-in link before you send a code.",
+            );
+          }
+          const response =
+            input.interactionId === flow.id && input.response.type === "credentials"
+              ? antigravityLoginResponse(
+                  flow.pending,
+                  input.response.values[LOGIN_CODE_FIELD] ?? "",
+                )
+              : undefined;
+          if (response === undefined) {
+            return yield* setupError(
+              "respond",
+              "Paste the code from the Antigravity page, or that page's full URL.",
+            );
+          }
+          flow.callbackSent = true;
+          yield* flow.submitCode(response);
+          yield* publishFlow(flow, {
+            ...flow.state,
+            phase: "verifying",
+            authorizationUrl: null,
+            message: "Waiting for Google to finish sign-in.",
+          });
+          return flow.state;
+        }),
+      );
     }),
     cancel: Effect.fn("AntigravityAuth.cancel")(function* (ownerSessionId, flowId) {
       const flow = yield* lock.withPermits(1)(requireFlow(ownerSessionId, flowId, "cancel"));
@@ -624,14 +663,26 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
             credentialOwner: "provider" as const,
             interaction:
               state.phase === "waiting" && state.authorizationUrl && state.flowId
-                ? {
-                    type: "browser" as const,
-                    id: state.flowId,
-                    url: state.authorizationUrl,
-                    requiresConsent: false,
-                    acceptsCallback: true,
-                  }
-                : (state.interaction ?? null),
+                ? value.codeLogin
+                  ? {
+                      type: "credentials" as const,
+                      id: state.flowId,
+                      fields: [
+                        {
+                          name: LOGIN_CODE_FIELD,
+                          label: "Code from the Antigravity page",
+                          secret: false,
+                        },
+                      ],
+                    }
+                  : {
+                      type: "browser" as const,
+                      id: state.flowId,
+                      url: state.authorizationUrl,
+                      requiresConsent: false,
+                      acceptsCallback: true,
+                    }
+                : null,
           };
         }),
         Stream.interruptWhen(Deferred.await(closed)),
@@ -654,5 +705,13 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
     }),
   );
 
-  return { controller, withProcess };
+  const onSignedInElsewhere = SubscriptionRef.update(snapshot, (value) =>
+    activeFlow === undefined &&
+    operation === "idle" &&
+    (value.state.phase === "failed" || value.state.phase === "cancelled")
+      ? { ownerSessionId: null, state: emptyState }
+      : value,
+  );
+
+  return { controller, withProcess, onSignedInElsewhere };
 });

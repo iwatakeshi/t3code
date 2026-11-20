@@ -1,5 +1,6 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Layer from "effect/Layer";
 import { describe, expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
@@ -11,9 +12,9 @@ import * as TestClock from "effect/testing/TestClock";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
 
 import {
-  AntigravityKeyringError,
   decodeGoKeyringSecret,
   makeAntigravityUsageProbe,
+  readWindowsCliCredential,
 } from "./antigravityUsageLimits.ts";
 
 const summary = {
@@ -69,11 +70,10 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     userId?: string;
     userInfoAt?: number;
     missingToken?: boolean;
-    runtimeKind?: "cli" | "legacy";
     authMethod?: "oauth-personal" | "oauth-business" | "gemini-api-key";
-    /** The 1.5.x CLI's stored sign-in, from the OS keyring or its fallback file. */
-    storedToken?: { readonly expiry: string; readonly in: "keyring" | "file" };
-    readKeyringSecret?: Effect.Effect<string | undefined, AntigravityKeyringError>;
+    keyringSecret?: string;
+    /** Reads the OS keyring instead of `keyringSecret`. */
+    nativeKeyring?: boolean;
   } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -92,25 +92,6 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
       }),
     );
   if (!options.missingToken) yield* writeToken(options.refreshToken ?? "refresh-a");
-  const storedToken = options.storedToken
-    ? JSON.stringify({
-        token: {
-          access_token: "access-token",
-          token_type: "Bearer",
-          refresh_token: "cli-refresh",
-          expiry: options.storedToken.expiry,
-          expires_in: 3599,
-        },
-        auth_method: "consumer",
-        id_token_email: "someone@example.com",
-      })
-    : undefined;
-  if (storedToken && options.storedToken?.in === "file") {
-    yield* fs.writeFileString(
-      path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token"),
-      storedToken,
-    );
-  }
   const requests: Array<{ url: string; body: string }> = [];
   const http = HttpClient.make((request, url, _signal, fiber) =>
     Effect.sync(() => {
@@ -138,9 +119,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
             : Response.json({}, { status: 403 }),
         );
       }
-      expect(JSON.parse(body)).toEqual(
-        options.missingToken || options.runtimeKind === "cli" ? {} : { project: "project-id" },
-      );
+      expect(JSON.parse(body)).toEqual(options.missingToken ? {} : { project: "project-id" });
       expect(request.headers["user-agent"]).toMatch(/^antigravity\/hub\/2\.24\.0 /);
       return HttpClientResponse.fromWeb(
         request,
@@ -161,10 +140,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   const usage = yield* makeAntigravityUsageProbe({
     profileDirectory,
     authMethod: options.authMethod ?? "oauth-personal",
-    runtimeKind: Effect.succeed(options.runtimeKind ?? "legacy"),
-    readKeyringSecret:
-      options.readKeyringSecret ??
-      Effect.succeed(options.storedToken?.in === "keyring" ? storedToken : undefined),
+    ...(options.nativeKeyring ? {} : { readKeyringSecret: Effect.succeed(options.keyringSecret) }),
   }).pipe(Effect.provideService(HttpClient.HttpClient, http));
   return { ...usage, requests, writeToken, tokenPath };
 });
@@ -687,6 +663,117 @@ describe("Antigravity subscription limits", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
+  it.effect("reads the native CLI's stored sign-in when acp_token.json is absent", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const { probe, tokenPath } = yield* fixture({ missingToken: true });
+      // The 1.5.x CLI never writes acp_token.json; without a keyring it stores this file instead.
+      yield* fs.writeFileString(
+        path.join(path.dirname(tokenPath), "antigravity-oauth-token"),
+        JSON.stringify({
+          token: {
+            access_token: "access-token",
+            token_type: "Bearer",
+            refresh_token: "refresh-a",
+            expiry: "2099-01-01T00:00:00Z",
+            expires_in: 3600,
+          },
+          auth_method: "consumer",
+          id_token_email: "someone@example.com",
+        }),
+      );
+      const limits = yield* probe;
+      expect(limits.unavailable?.message).not.toBe(
+        "Sign in with Google to see Antigravity limits.",
+      );
+      expect(limits.unavailable?.reason).not.toBe("unsupported");
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("reads a Gemini Enterprise keyring sign-in and reports when it has expired", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
+      const keyringSecret = (expiry: string) =>
+        JSON.stringify({ token: { access_token: "access-token", refresh_token: "r", expiry } });
+      // Google account instances keep their own sign-in; the shared entry belongs to another app.
+      const personal = yield* fixture({
+        missingToken: true,
+        keyringSecret: keyringSecret("2026-10-09T14:00:00Z"),
+      });
+      expect((yield* personal.probe).unavailable?.message).toBe(
+        "Sign in with Google to see Antigravity limits.",
+      );
+      expect(personal.requests).toEqual([]);
+
+      const signedIn = yield* fixture({
+        authMethod: "oauth-business",
+        missingToken: true,
+        userId: "google-user-1",
+        keyringSecret: keyringSecret("2026-10-09T14:00:00.123456789+01:00"),
+      });
+      const limits = yield* signedIn.probe;
+      expect(limits.unavailable).toBeUndefined();
+      expect(limits.windows).toHaveLength(4);
+      expect(signedIn.requests.some((request) => request.url.endsWith("/token"))).toBe(false);
+
+      const expired = yield* fixture({
+        authMethod: "oauth-business",
+        missingToken: true,
+        keyringSecret: keyringSecret("2026-10-09T12:00:30Z"),
+      });
+      expect((yield* expired.probe).unavailable?.reason).toBe("probeFailed");
+      expect(expired.requests).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect.runIf(HostProcess.Platform.defaultValue() === "win32")(
+    "reads go-keyring's Windows credential target without changing it",
+    (ctx) =>
+      Effect.gen(function* () {
+        // Never overwrite a real sign-in on a developer's machine.
+        if (readWindowsCliCredential(HostProcess.Architecture.defaultValue())) return ctx.skip();
+        yield* TestClock.setTime(
+          DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")),
+        );
+        const { AsyncEntry } = yield* Effect.promise(() => import("@napi-rs/keyring"));
+        // go-keyring writes the UTF-8 JSON at `<service>:<user>`.
+        const target = AsyncEntry.withTarget("gemini:antigravity", "gemini", "antigravity");
+        const stored = new TextEncoder().encode(
+          JSON.stringify({
+            token: { access_token: "access-token", expiry: "2026-10-09T14:00:00Z" },
+          }),
+        );
+        yield* Effect.acquireRelease(
+          Effect.promise(() => target.setSecret(stored)),
+          () => Effect.promise(() => target.deleteCredential()),
+        );
+        const { probe } = yield* fixture({
+          authMethod: "oauth-business",
+          missingToken: true,
+          nativeKeyring: true,
+        });
+        const limits = yield* probe;
+        expect(limits.unavailable).toBeUndefined();
+        expect(limits.windows).toHaveLength(4);
+        expect(readWindowsCliCredential(HostProcess.Architecture.defaultValue())).toEqual(
+          Buffer.from(stored),
+        );
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it("decodes go-keyring's macOS encodings", () => {
+    const value = '{"token":{}}';
+    const bytes = (text: string) => new TextEncoder().encode(text);
+    expect(decodeGoKeyringSecret(bytes(value))).toBe(value);
+    expect(
+      decodeGoKeyringSecret(bytes(`go-keyring-base64:${Buffer.from(value).toString("base64")}`)),
+    ).toBe(value);
+    expect(
+      decodeGoKeyringSecret(bytes(`go-keyring-encoded:${Buffer.from(value).toString("hex")}`)),
+    ).toBe(value);
+  });
+
   it.effect("does not make network requests for API keys or missing sign-ins", () =>
     Effect.gen(function* () {
       for (const options of [{ authMethod: "gemini-api-key" as const }, { missingToken: true }]) {
@@ -696,71 +783,4 @@ describe("Antigravity subscription limits", () => {
       }
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
-  it.effect("reads the Antigravity CLI's keyring sign-in without refreshing it", () =>
-    Effect.gen(function* () {
-      for (const missingToken of [true, false]) {
-        const { probe, requests } = yield* fixture({
-          missingToken,
-          runtimeKind: "cli",
-          userId: "google-user-1",
-          storedToken: { expiry: "2026-10-09T12:00:00.123456789+11:00", in: "keyring" },
-        });
-        const limits = yield* probe;
-        expect(limits.unavailable).toBeUndefined();
-        expect(limits.windows).toHaveLength(4);
-        expect(limits.credentialFingerprint).toMatch(/^[0-9a-f]{64}$/);
-        expect(requests.some((request) => request.url.endsWith("/token"))).toBe(false);
-        expect(JSON.stringify(limits)).not.toMatch(/cli-refresh|access-token|someone@example.com/);
-      }
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("reads the CLI's token file before the keyring", () =>
-    Effect.gen(function* () {
-      const { probe } = yield* fixture({
-        missingToken: true,
-        storedToken: { expiry: "2026-10-09T12:00:00Z", in: "file" },
-        readKeyringSecret: Effect.die("the keyring must not be read"),
-      });
-      expect((yield* probe).windows).toHaveLength(4);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("waits for the CLI to refresh an expired stored sign-in", () =>
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T12:00:00Z")));
-      const { probe, requests } = yield* fixture({
-        missingToken: true,
-        storedToken: { expiry: "2026-10-09T12:00:30Z", in: "keyring" },
-      });
-      const limits = yield* probe;
-      expect(limits.unavailable).toEqual({
-        reason: "probeFailed",
-        message: "Antigravity limits update when an Antigravity session starts.",
-      });
-      expect(requests).toEqual([]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it.effect("returns a safe failure when the keyring cannot be read", () =>
-    Effect.gen(function* () {
-      const { probe, requests } = yield* fixture({
-        missingToken: true,
-        readKeyringSecret: Effect.fail(new AntigravityKeyringError({ cause: "keyring locked" })),
-      });
-      expect((yield* probe).unavailable?.reason).toBe("probeFailed");
-      expect(requests).toEqual([]);
-    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-  );
-
-  it("decodes go-keyring's macOS encodings and leaves plain values alone", () => {
-    const bytes = (text: string) => Array.from(new TextEncoder().encode(text));
-    const value = '{"token":{}}';
-    expect(decodeGoKeyringSecret(bytes(value))).toBe(value);
-    expect(decodeGoKeyringSecret(bytes(`go-keyring-base64:${btoa(value)}`))).toBe(value);
-    const hex = Array.from(new TextEncoder().encode(value), (byte) =>
-      byte.toString(16).padStart(2, "0"),
-    ).join("");
-    expect(decodeGoKeyringSecret(bytes(`go-keyring-encoded:${hex}`))).toBe(value);
-  });
 });

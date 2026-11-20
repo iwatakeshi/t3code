@@ -13,8 +13,9 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
-import { useRef, useState, useEffect, useEffectEvent } from "react";
-import { Linking, Pressable, ScrollView, TextInput, useWindowDimensions, View } from "react-native";
+import { useRef, useState } from "react";
+import { Pressable, ScrollView, TextInput, useWindowDimensions, View } from "react-native";
+import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { m } from "../../i18n/messages";
 
@@ -196,24 +197,6 @@ function ProviderAccount({
       ? interaction.url
       : state?.authorizationUrl;
   const disabled = pending || auth.error !== null || isDiscovering;
-  const openedFlow = useRef<string | null>(null);
-  const openSignInPage = useEffectEvent(() => {
-    if (url)
-      void Linking.openURL(url).catch(() => setError(gt("Could not open the sign-in page.")));
-  });
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- opens external OAuth once the remote provider supplies its browser interaction
-  useEffect(() => {
-    if (
-      provider.driver !== "antigravity" ||
-      interaction?.type !== "browser" ||
-      state?.phase !== "waiting" ||
-      !state.flowId ||
-      openedFlow.current === state.flowId
-    )
-      return;
-    openedFlow.current = state.flowId;
-    openSignInPage();
-  }, [provider.driver, interaction?.type, state?.phase, state?.flowId]);
   async function run(command: () => Promise<AtomCommandResult<unknown, unknown>>) {
     if (pendingRef.current) return false;
     pendingRef.current = true;
@@ -387,9 +370,9 @@ function ProviderAccount({
       variant="pill"
       label={gt("Docs")}
       onPress={() => {
-        void Linking.openURL(provider.setup!.documentationUrl!).catch(() =>
-          setError(gt("Could not open the provider docs.")),
-        );
+        void tryOpenExternalUrl(provider.setup!.documentationUrl!).then((opened) => {
+          if (!opened) setError(gt("Could not open the provider docs."));
+        });
       }}
     />
   ) : active && state?.flowId ? (
@@ -509,13 +492,7 @@ function ProviderAccount({
           ) : null}
           {showCallback ? (
             <>
-              {field(
-                "callback",
-                provider.driver === "antigravity"
-                  ? gt("Authorization code or return URL")
-                  : gt("Final localhost URL"),
-                false,
-              )}
+              {field("callback", gt("Final localhost URL"), false)}
               <SettingsActionRow
                 icon="arrow.right"
                 label={gt("Continue")}
@@ -554,7 +531,8 @@ function ProviderAccount({
                 !(await send({ type: "browser", action: "accept" }))
               )
                 return;
-              await Linking.openURL(url);
+              if (!(await tryOpenExternalUrl(url, "provider-auth")))
+                setError(gt("Could not open the sign-in page."));
             })().catch(() => setError(gt("Could not open the sign-in page.")));
           }}
         />
