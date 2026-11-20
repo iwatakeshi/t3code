@@ -287,6 +287,7 @@ export type OrchestratorMcpTaskStatusInput = typeof OrchestratorMcpTaskStatusInp
 
 export const OrchestratorMcpTaskCancelInput = Schema.Struct({
   taskId: NodeId,
+  parentThreadId: Schema.optional(ThreadId),
   reason: Schema.optional(Schema.String.check(Schema.isMaxLength(2_000))),
   clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
 });

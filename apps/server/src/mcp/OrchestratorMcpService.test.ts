@@ -809,19 +809,40 @@ describe("OrchestratorMcpService", () => {
     }),
   );
 
-  it.effect.each(["no runs", "a finished run"] as const)(
-    "cancels an orphaned follow-up through its parent when the child has %s",
-    (childState) =>
+  it.effect.each([
+    { childState: "no runs", otherThread: false, refusal: undefined },
+    { childState: "a finished run", otherThread: false, refusal: undefined },
+    { childState: "a finished run", otherThread: true, refusal: undefined },
+    { childState: "a finished run", otherThread: true, refusal: "parent_not_active" },
+    { childState: "a finished run", otherThread: true, refusal: "runtime_mode_escalation_denied" },
+    {
+      childState: "a finished run",
+      otherThread: true,
+      refusal: "interaction_mode_escalation_denied",
+    },
+  ] as const)(
+    "cancels an orphaned follow-up through its parent when the child has $childState (another thread: $otherThread, refusal: $refusal)",
+    ({ childState, otherThread, refusal }) =>
       Effect.gen(function* () {
         const parentThreadId = ThreadId.make("thread:mcp-orphan-parent");
+        const callerThreadId = otherThread
+          ? ThreadId.make("thread:mcp-cancel-other")
+          : parentThreadId;
         const childThreadId = ThreadId.make("thread:mcp-orphan-child");
         const taskId = NodeId.make("node:mcp-orphan-task");
         const parentRunId = RunId.make("run:mcp-orphan-parent");
+        const callerShell = liveThreadShell(callerThreadId, {
+          ...(refusal === "parent_not_active" ? { activeRunId: null } : {}),
+          ...(refusal === "runtime_mode_escalation_denied"
+            ? { runtimeMode: "approval-required" }
+            : {}),
+          ...(refusal === "interaction_mode_escalation_denied" ? { interactionMode: "plan" } : {}),
+        });
         const dispatched = yield* Ref.make<ReadonlyArray<OrchestrationV2ServerCommand>>([]);
         const status = yield* Ref.make("running");
         const parentProjection = (taskStatus: string) =>
           ({
-            thread: { id: parentThreadId },
+            thread: { ...idleThreadProjection(liveThreadShell(parentThreadId)).thread },
             runs: [],
             contextTransfers: [],
             subagents: [
@@ -859,10 +880,14 @@ describe("OrchestratorMcpService", () => {
           NodeCrypto.layer,
           Layer.mock(ThreadManagementService.ThreadManagementService)({
             getThreadRecords: (threadId) =>
-              threadId === parentThreadId
-                ? Effect.map(Ref.get(status), parentProjection)
-                : Effect.succeed(childProjection),
-            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+              threadId === callerThreadId && otherThread
+                ? Effect.succeed(idleThreadProjection(callerShell))
+                : threadId === parentThreadId
+                  ? Effect.map(Ref.get(status), parentProjection)
+                  : Effect.succeed(childProjection),
+            getThreadShell: (threadId) =>
+              Effect.succeed(threadId === callerThreadId ? callerShell : liveThreadShell(threadId)),
+            getProjectThreadRecords: () => Effect.map(Ref.get(status), parentProjection),
             listAppOwnedChildThreadIds: () => Effect.succeed([]),
             delegatedTaskResultPending: () => Effect.succeed(false),
             stopDelegatedTasks: () => Effect.void,
@@ -891,7 +916,7 @@ describe("OrchestratorMcpService", () => {
           environmentId: EnvironmentId.make("environment:mcp-orphan"),
           requestNamespace: "provider-session:mcp-orphan",
           thread: {
-            threadId: parentThreadId,
+            threadId: callerThreadId,
             providerSessionId: "provider-session:mcp-orphan",
             providerInstanceId: ProviderInstanceId.make("codex"),
           },
@@ -902,8 +927,17 @@ describe("OrchestratorMcpService", () => {
 
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          if (refusal !== undefined) {
+            const error = yield* service
+              .cancelTask(scope, { taskId, parentThreadId })
+              .pipe(Effect.flip);
+            assert.equal(error.code, refusal);
+            assert.deepEqual(yield* Ref.get(dispatched), []);
+            return;
+          }
           const result = yield* service.cancelTask(scope, {
             taskId,
+            ...(otherThread ? { parentThreadId } : {}),
             clientRequestId: "cancel-orphan-task",
           });
           assert.deepEqual(result, { taskId, status: "cancelled" });

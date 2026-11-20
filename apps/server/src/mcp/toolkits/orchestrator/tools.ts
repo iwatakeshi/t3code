@@ -117,7 +117,7 @@ const TaskStatusTool = Tool.make("task_status", {
 
 const TaskCancelTool = Tool.make("task_cancel", {
   description:
-    "Stop one delegated task by `taskId`. Stops its running and queued turns, its delegates, and its PR watches, including later runs in its child thread. A finished task keeps its result.",
+    "Stop one delegated task by `taskId`. From another conversation, pass its originating `parentThreadId`; no need to open that conversation. Caller permissions still apply. Stops its running and queued turns, its delegates, and its PR watches, including later runs in its child thread. A finished task keeps its result.",
   parameters: OrchestratorMcpTaskCancelInput,
   success: OrchestratorMcpTaskCancelResult,
   failure: OrchestratorMcpFailure,

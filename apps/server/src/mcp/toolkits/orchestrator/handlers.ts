@@ -34,12 +34,14 @@ const handlers = {
       return yield* service.taskStatus(scope, taskId);
     }),
   ),
-  task_cancel: McpToolAccess.actsAsCaller((input) =>
-    Effect.gen(function* () {
-      const scope = yield* McpInvocationContext.McpInvocationContext;
-      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-      return yield* service.cancelTask(scope, input);
-    }),
+  task_cancel: McpToolAccess.writesThreads(
+    (input) => [input.parentThreadId],
+    (input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* service.cancelTask(scope, input);
+      }),
   ),
   t3_workflow_stop: McpToolAccess.writesThreads(
     (input) => [input.threadId],

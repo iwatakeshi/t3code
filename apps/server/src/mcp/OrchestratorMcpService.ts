@@ -3444,7 +3444,16 @@ const make = Effect.gen(function* () {
     }),
     cancelTask: Effect.fn("OrchestratorMcpService.cancelTask")(function* (callerScope, input) {
       yield* requireCapability(callerScope);
-      const scope = yield* requireThreadScope(callerScope, "task_cancel");
+      const caller = yield* requireThreadScope(callerScope, "task_cancel");
+      let scope = caller;
+      if (input.parentThreadId !== undefined && input.parentThreadId !== caller.thread.threadId) {
+        const { parent, limits, target } = yield* loadScopedThread(caller, input.parentThreadId, [
+          "runs",
+        ]);
+        yield* assertLiveCallerForOtherThread(caller, parent, target);
+        yield* assertTargetWithinLimits(limits, target.thread);
+        scope = { ...caller, thread: { ...caller.thread, threadId: target.thread.id } };
+      }
       const queued = (yield* loadTasks(scope.thread.threadId, [input.taskId]))[0];
       if (
         queued?.queuedPlacement !== undefined &&
