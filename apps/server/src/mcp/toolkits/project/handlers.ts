@@ -479,11 +479,15 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         );
         const thread = result.projection.thread;
         const run = result.projection.runs.find((run) => run.userMessageId === messageId);
+        const provider = (yield* (yield* ProviderRegistry.ProviderRegistry).getProviders).find(
+          (candidate) => candidate.instanceId === thread.modelSelection.instanceId,
+        );
         return {
           threadId: thread.id,
           link: McpInvocationContext.threadLinkFor(scope, thread.id, thread.title),
           projectId: thread.projectId,
           modelSelection: thread.modelSelection,
+          ...(provider === undefined ? {} : { providerDriverKind: provider.driver }),
           runId: run?.id ?? null,
           status: run?.status ?? null,
         };

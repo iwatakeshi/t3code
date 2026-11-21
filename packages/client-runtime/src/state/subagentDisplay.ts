@@ -1,5 +1,7 @@
 import type {
   ModelSelection,
+  OrchestrationV2RemoteTaskChild,
+  ProviderDriverKind,
   OrchestrationV2TurnItemStatus,
   OrchestrationV2ThreadShell,
   OrchestrationProjectShell,
@@ -189,5 +191,16 @@ export function subagentCardDetail(detail: string | null | undefined): string | 
       .replace(/^[ \t]*[-*][ \t]+/gm, "")
       .replace(/\s+/g, " ")
       .trim() || null
+  );
+}
+
+export function resolveSubagentProviderDriver(input: {
+  readonly driver?: ProviderDriverKind | undefined;
+  readonly remoteChild?: Pick<OrchestrationV2RemoteTaskChild, "providerDriverKind"> | undefined;
+  readonly provider?: Pick<ServerProvider, "driver"> | null | undefined;
+}) {
+  return (
+    input.provider?.driver ??
+    (input.remoteChild === undefined ? input.driver : input.remoteChild.providerDriverKind)
   );
 }

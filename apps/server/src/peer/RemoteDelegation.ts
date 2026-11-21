@@ -438,6 +438,9 @@ const make = Effect.gen(function* () {
         environmentId: target.environmentId,
         threadId: launched.threadId,
         label: link?.label ?? target.environmentId,
+        ...(launched.providerDriverKind === undefined
+          ? {}
+          : { providerDriverKind: launched.providerDriverKind }),
         title,
         ...(launched.runId === null ? {} : { runId: launched.runId }),
       };
@@ -547,6 +550,9 @@ const make = Effect.gen(function* () {
             environmentId,
             threadId: sent.threadId,
             label: finished.remoteChild.label,
+            ...(finished.remoteChild.providerDriverKind === undefined
+              ? {}
+              : { providerDriverKind: finished.remoteChild.providerDriverKind }),
             runId: sent.runId,
           },
           completionWake: "always",

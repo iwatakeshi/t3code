@@ -24,6 +24,7 @@ import {
 import {
   formatSubagentDisplayTitle,
   subagentCardDetail,
+  resolveSubagentProviderDriver,
 } from "@t3tools/client-runtime/state/subagent-display";
 import {
   ProviderDriverKind,
@@ -341,7 +342,11 @@ export function EnvironmentSubagentAvatar({
   return (
     <SubagentAvatar
       {...props}
-      driver={providerDriver ?? (remote === undefined ? driver : undefined)}
+      driver={resolveSubagentProviderDriver({
+        driver,
+        remoteChild: remote,
+        provider: providerDriver === undefined ? undefined : { driver: providerDriver },
+      })}
       displayName={displayName}
       iconUrl={iconUrl}
       accentColor={accentColor}

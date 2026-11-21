@@ -6,6 +6,7 @@ import {
 } from "@t3tools/client-runtime/state/provider-instance-display";
 import {
   resolveSubagentMetadata,
+  resolveSubagentProviderDriver,
   subagentCardDetail,
 } from "@t3tools/client-runtime/state/subagent-display";
 import { formatSubagentEffort } from "@t3tools/client-runtime/state/thread-execution";
@@ -137,9 +138,7 @@ function SubagentMetadata(props: {
     (candidate) => candidate.instanceId === subagent.providerInstanceId,
   );
   const showBadge = provider !== undefined && shouldShowInstanceBadge(provider, providers);
-  // A remote task's own driver is only a "remote" label.
-  const driver =
-    provider?.driver ?? (subagent.remoteChild === undefined ? subagent.driver : undefined);
+  const driver = resolveSubagentProviderDriver({ ...subagent, provider });
   const parent = useThreadShell(scopeThreadRef(environmentId, subagent.threadId))?.source;
   const child = useThreadShell(
     subagent.childThreadId === null ? null : scopeThreadRef(environmentId, subagent.childThreadId),

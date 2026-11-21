@@ -1,6 +1,11 @@
+import { ProviderDriverKind } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { subagentCardDetail, subagentDetailPreview } from "./subagentDisplay.js";
+import {
+  resolveSubagentProviderDriver,
+  subagentCardDetail,
+  subagentDetailPreview,
+} from "./subagentDisplay.js";
 
 describe("subagentDetailPreview", () => {
   it("prefers progress for live work and results for settled work", () => {
@@ -49,4 +54,33 @@ describe("subagentCardDetail", () => {
   ])("strips image and link markup from %s", (detail, expected) => {
     expect(subagentCardDetail(detail)).toBe(expected);
   });
+});
+
+describe("resolveSubagentProviderDriver", () => {
+  it.each([
+    ["antigravity", "remote", { providerDriverKind: "claudeAgent" }, "antigravity"],
+    [undefined, "remote", { providerDriverKind: "antigravity" }, "antigravity"],
+    [undefined, "remote", {}, undefined],
+    [undefined, "codex", undefined, "codex"],
+    [undefined, "codex", {}, undefined],
+  ] as const)(
+    "resolves provider %s, task driver %s and remote %j",
+    (provider, driver, remote, expected) => {
+      expect(
+        resolveSubagentProviderDriver({
+          driver: ProviderDriverKind.make(driver),
+          remoteChild:
+            remote === undefined
+              ? undefined
+              : {
+                  providerDriverKind: !("providerDriverKind" in remote)
+                    ? undefined
+                    : ProviderDriverKind.make(remote.providerDriverKind),
+                },
+          provider:
+            provider === undefined ? undefined : { driver: ProviderDriverKind.make(provider) },
+        }),
+      ).toBe(expected);
+    },
+  );
 });

@@ -6,7 +6,10 @@ import {
   resolveProviderInstanceDisplayName,
   shouldShowInstanceBadge,
 } from "@t3tools/client-runtime/state/provider-instance-display";
-import { summarizeSubagentStatuses } from "@t3tools/client-runtime/state/subagent-display";
+import {
+  resolveSubagentProviderDriver,
+  summarizeSubagentStatuses,
+} from "@t3tools/client-runtime/state/subagent-display";
 import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
 import type {
   EnvironmentId,
@@ -54,9 +57,7 @@ function SubagentAvatar(props: {
   const provider = providers.find(
     (candidate) => candidate.instanceId === props.item.providerInstanceId,
   );
-  // A remote task's own driver is only a "remote" label.
-  const driver =
-    provider?.driver ?? (props.item.remoteChild === undefined ? props.item.driver : undefined);
+  const driver = resolveSubagentProviderDriver({ ...props.item, provider });
   const badgeEntries = providers.map((candidate) => {
     const rawConfig = props.config?.settings.providerInstances[candidate.instanceId]?.config;
     const instanceConfig =

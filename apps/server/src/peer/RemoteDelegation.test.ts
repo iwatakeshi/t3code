@@ -1112,6 +1112,10 @@ it.effect.each(["shared", "worktree"] as const)(
           remoteChild: { environmentId: string; threadId: ThreadId };
         };
         expect(delegated.remoteChild.environmentId).toBe(box.environmentId);
+        const recorded = (yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+          (task) => task.id === delegated.taskId,
+        );
+        expect(recorded?.remoteChild?.providerDriverKind).toBe(boxClaude.driver);
         expect((result.structuredContent as { baseCommit?: string }).baseCommit).toBe(
           isolation === "worktree" ? parentCommit : undefined,
         );
@@ -1141,8 +1145,20 @@ it.effect.each(["shared", "worktree"] as const)(
         yield* Deferred.succeed(thread.finished, undefined);
         expect(yield* taskResult(a, delegated.taskId)).toMatchObject({
           status: "completed",
+          remoteChild: { providerDriverKind: boxClaude.driver },
           result: "Review complete on the worker.",
         });
+        const sent = yield* a.call("t3_thread_send", {
+          environmentId: box.environmentId,
+          threadId: delegated.remoteChild.threadId,
+          message: "Review the follow-up too.",
+        });
+        expect(sent.isError, JSON.stringify(sent.content)).toBe(false);
+        const followUpId = (sent.structuredContent as { taskId: NodeId }).taskId;
+        const followUp = (yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+          (task) => task.id === followUpId,
+        );
+        expect(followUp?.remoteChild?.providerDriverKind).toBe(boxClaude.driver);
       }),
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
