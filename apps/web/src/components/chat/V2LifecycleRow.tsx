@@ -4,7 +4,7 @@ import { AgentElapsed } from "./AgentElapsed";
 import { projectedSubagentsToRuntime } from "@t3tools/client-runtime/state/subagentRuntime";
 import type { ReactNode } from "react";
 import { useThreadShell, useProject } from "../../state/entities";
-import { useEnvironment } from "../../state/environments";
+import { useOpenLinkedConversation } from "../../state/peerLinks";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import { useNavigate } from "@tanstack/react-router";
 import { SubagentTooltipContent } from "./SubagentTooltipContent";
@@ -456,7 +456,7 @@ function SubagentTimelineLink(props: {
     (thread) => thread?.projection.subagents.find((agent) => agent.id === props.subagentId) ?? null,
   );
   const remote = props.remote ?? agent?.remoteChild;
-  const remoteEnvironment = useEnvironment(remote?.environmentId ?? null);
+  const { openConversation, opening } = useOpenLinkedConversation(props.parentRef.environmentId);
   const gt = useGT();
   const m = useMessages();
   const navigate = useNavigate();
@@ -465,12 +465,14 @@ function SubagentTimelineLink(props: {
   const open =
     threadId !== null
       ? () => props.onOpenThread(threadId)
-      : remote !== undefined && remoteEnvironment !== null
-        ? () =>
+      : remote !== undefined
+        ? async () => {
+            if (!(await openConversation(remote))) return;
             void navigate({
               to: "/$environmentId/$threadId",
               params: buildThreadRouteParams(scopeThreadRef(remote.environmentId, remote.threadId)),
-            })
+            });
+          }
         : null;
   const liveStatus = agent?.status ?? props.status;
   const status = props.event ? props.event.status : liveStatus;
@@ -498,7 +500,7 @@ function SubagentTimelineLink(props: {
       <span className="min-w-0 flex-1">
         <span className="flex items-baseline gap-2">
           <span className="min-w-0 truncate text-xs font-medium text-foreground">
-            {props.title}
+            {opening ? gt("Opening conversation…") : props.title}
           </span>
           {remote !== undefined ? (
             <span className="shrink-0 text-xs text-muted-foreground">

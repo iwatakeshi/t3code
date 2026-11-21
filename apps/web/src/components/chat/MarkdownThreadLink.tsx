@@ -58,6 +58,20 @@ export function MarkdownThreadLink(props: {
     : null;
   const remote = useThreadShell(remoteRef);
   const resolved = target ?? (remoteRef && remote ? { ref: remoteRef, metadata: remote } : null);
+  if (
+    !reachable &&
+    props.link.environmentId !== null &&
+    props.link.environmentId !== props.environmentId
+  ) {
+    return (
+      <ThreadContextChip
+        record={{ ...writtenRef, title: props.label ?? gt("Thread") }}
+        projectId={null}
+        coordinatorId={props.environmentId}
+        candidateThreadIds={candidates.map((candidate) => candidate.threadId)}
+      />
+    );
+  }
   if (missing && resolved === null) {
     const unknown = unknownThreadLinkLabel(props.link, props.environmentId, messages);
     return <UnresolvedChip label={props.label ?? unknown} tooltip={unknown} />;

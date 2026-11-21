@@ -4158,7 +4158,6 @@
   "309b160785f6c473": "Abrir la bifurcación en este chat",
   "6676cd4b8299663f": "Abrir el hilo principal en este chat",
   "63e8c7a0ef0513b5": "Hilos relacionados",
-  "68060b380fe53942": "Se ejecuta en {label}. Conéctate para abrir el hilo allí.",
   "9996d9dac573001a": "Abrir en {label}",
   "15a601a94893277f": "No se pudo abrir el hilo principal",
   "5eb43f554a5b7a58": "El hilo principal se eliminó",
@@ -12191,5 +12190,8 @@
   "27d76249d09eb69f": "Guía de revisión lista",
   "faa3bb26abb39c93": "Falló la guía de revisión",
   "b7df38b7d8792d78": "Abrir guía",
-  "9e91e9a77b664e4e": "No se pudo iniciar una guía de revisión"
+  "9e91e9a77b664e4e": "No se pudo iniciar una guía de revisión",
+  "f38f3c17a01c7093": "Entorno vinculado",
+  "8133f1bc777e09d9": "Abriendo conversación…",
+  "a68d753aed6a7895": "No se pudo abrir la conversación"
 }

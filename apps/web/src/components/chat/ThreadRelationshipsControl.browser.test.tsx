@@ -8,6 +8,10 @@ import { page, userEvent } from "vite-plus/test/browser";
 
 import "~/index.css";
 
+vi.mock(import("../../state/peerLinks"), () => ({
+  useOpenLinkedConversation: () => ({ openConversation: async () => true, opening: false }),
+}));
+
 const state = vi.hoisted(() => ({
   projection: null as unknown,
   commandSucceeds: false,
@@ -331,11 +335,13 @@ it("shows a remote subagent's full title in its tooltip even when its environmen
     expect(document.querySelector('[data-slot="tooltip-popup"]')?.textContent).toContain(longTitle),
   );
   expect(document.querySelector('[data-slot="tooltip-popup"]')?.textContent).toContain(
-    "Runs on Remote VM with a long machine name in the office. Connect to it to open the thread there.",
+    "Open on Remote VM with a long machine name in the office",
   );
 
   await row.click({ force: true });
-  expect(screen.router?.state.location.pathname).toBe("/environment/fork");
+  await vi.waitFor(() =>
+    expect(screen.router?.state.location.pathname).toBe(`/${remoteEnvId}/${remoteThreadId}`),
+  );
 });
 
 it("explains why Merge back is unavailable before the fork completes a run", async () => {

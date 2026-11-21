@@ -1,3 +1,4 @@
+import { useOpenLinkedConversation } from "../../state/peerLinks";
 import { useAtomValue } from "@effect/atom-react";
 import { threadKey } from "@t3tools/client-runtime/state/entities";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
@@ -286,6 +287,7 @@ function currentSubagent<Agent extends RuntimeSubagent>(
  * the thread there, when this client is connected to that environment.
  */
 function RemoteSubagentRow(props: {
+  readonly coordinatorId: EnvironmentId;
   readonly agent: RemoteSubagent;
   readonly provider: ServerProvider | undefined;
   readonly anyInstanceBadge: boolean;
@@ -293,7 +295,7 @@ function RemoteSubagentRow(props: {
   const gt = useGT();
   const m = useMessages();
   const navigate = useNavigate();
-  const environment = useEnvironment(props.agent.remoteChild.environmentId);
+  const { openConversation, opening } = useOpenLinkedConversation(props.coordinatorId);
   const { remoteChild } = props.agent;
   const status = props.agent.status;
   const failed = status === "failed";
@@ -311,9 +313,10 @@ function RemoteSubagentRow(props: {
               size="sm"
               variant="ghost"
               part="row"
-              aria-disabled={environment === null || undefined}
-              onClick={() => {
-                if (environment === null) return;
+              aria-busy={opening || undefined}
+              disabled={opening}
+              onClick={async () => {
+                if (!(await openConversation(remoteChild))) return;
                 void navigate({
                   to: "/$environmentId/$threadId",
                   params: buildThreadRouteParams(
@@ -333,7 +336,7 @@ function RemoteSubagentRow(props: {
           />
           <span className="min-w-0 flex-1">
             <span className="block truncate text-left text-sm font-medium leading-4 text-foreground/85">
-              {title}
+              {opening ? gt("Opening conversation…") : title}
             </span>
           </span>
           <span
@@ -350,13 +353,7 @@ function RemoteSubagentRow(props: {
         <TooltipPopup side="left">
           <LineageTooltipContent
             title={title}
-            hint={
-              environment === null
-                ? gt("Runs on {label}. Connect to it to open the thread there.", {
-                    label: remoteChild.label,
-                  })
-                : gt("Open on {label}", { label: remoteChild.label })
-            }
+            hint={gt("Open on {label}", { label: remoteChild.label })}
           />
         </TooltipPopup>
       </Tooltip>
@@ -1087,6 +1084,7 @@ export function ThreadRelationshipsPanel(props: {
                   "remote" in row ? (
                     <RemoteSubagentRow
                       key={row.remote.id}
+                      coordinatorId={ref.environmentId}
                       agent={row.remote}
                       // Its provider instance belongs to the environment it runs in.
                       provider={providersByEnvironment

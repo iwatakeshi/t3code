@@ -1,3 +1,4 @@
+import * as Redacted from "effect/Redacted";
 import {
   type DesktopSshEnvironmentTarget,
   EnvironmentId,
@@ -48,6 +49,7 @@ import {
   ConnectionBlockedError,
   BearerConnectionTarget,
   PrimaryConnectionTarget,
+  LinkedConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
   type ConnectionTarget,
@@ -1565,6 +1567,39 @@ describe("EnvironmentRegistry", () => {
         );
         expect(yield* Ref.get(attempts)).toBeGreaterThanOrEqual(2);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("keeps linked conversation routes temporary and gives paired routes precedence", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([]);
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const linked = new LinkedConnectionTarget({
+          environmentId: TARGET.environmentId,
+          label: "Worker via coordinator",
+          coordinatorId: EnvironmentId.make("coordinator"),
+          httpBaseUrl: "http://localhost/api/peer-conversations/route",
+          wsBaseUrl: "ws://localhost/api/peer-conversations/route/ws",
+          token: Redacted.make("temporary-conversation-grant"),
+        });
+        yield* registry.registerLinked(linked);
+        expect(
+          (yield* SubscriptionRef.get(registry.entries)).get(TARGET.environmentId)?.target,
+        ).toEqual(linked);
+        expect(yield* Ref.get(harness.storedTargets)).toEqual([]);
+        expect((yield* Ref.get(harness.storedCredentials)).size).toBe(0);
+        const direct = new RelayConnectionTarget({
+          environmentId: TARGET.environmentId,
+          label: "Worker",
+        });
+        yield* registry.register(new RelayConnectionRegistration({ target: direct }));
+        yield* registry.registerLinked(linked);
+        expect(
+          (yield* SubscriptionRef.get(registry.entries)).get(TARGET.environmentId)?.target,
+        ).toEqual(direct);
+        expect(yield* Ref.get(harness.storedTargets)).toEqual([direct]);
+      }).pipe(Effect.provide(harness.layer));
     }),
   );
 

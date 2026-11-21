@@ -41,8 +41,20 @@ export class SshConnectionTarget extends Schema.TaggedClass<SshConnectionTarget>
   },
 ) {}
 
+export class LinkedConnectionTarget extends Schema.TaggedClass<LinkedConnectionTarget>()(
+  "LinkedConnectionTarget",
+  {
+    ...ConnectionTargetBase,
+    coordinatorId: EnvironmentId,
+    httpBaseUrl: Schema.String,
+    wsBaseUrl: Schema.String,
+    token: Schema.Redacted(Schema.String),
+  },
+) {}
+
 export const ConnectionTarget = Schema.Union([
   PrimaryConnectionTarget,
+  LinkedConnectionTarget,
   BearerConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,

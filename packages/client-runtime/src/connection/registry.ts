@@ -29,6 +29,7 @@ import * as ConnectionCredentialStore from "./credentialStore.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 import * as Connectivity from "./connectivity.ts";
 import type {
+  LinkedConnectionTarget,
   ConnectionAttemptError,
   ConnectionTarget,
   NetworkStatus,
@@ -110,6 +111,7 @@ export class EnvironmentRegistry extends Context.Service<
       registration: ConnectionRegistration,
       options?: { readonly knownAddressOnly?: boolean },
     ) => Effect.Effect<boolean, Persistence.ConnectionPersistenceError | ConnectionBlockedError>;
+    readonly registerLinked: (target: LinkedConnectionTarget) => Effect.Effect<void>;
     /**
      * Fails when the route would add a new address to a saved user environment. Pairing that does
      * not target an environment checks this, because the server reports its own environment id.
@@ -528,7 +530,9 @@ export const make = Effect.gen(function* () {
     );
 
   const persistedRoutes = (entry: ConnectionCatalogEntry) =>
-    connectionRoutes(entry).map((route) => route.target as PersistedConnectionTarget);
+    connectionRoutes(entry)
+      .filter((route) => route.target._tag !== "LinkedConnectionTarget")
+      .map((route) => route.target as PersistedConnectionTarget);
 
   /**
    * Pull request routing trust and an unsupported verdict both belong to the saved addresses: a changed set may
@@ -548,7 +552,8 @@ export const make = Effect.gen(function* () {
   ) {
     const environmentId = route.target.environmentId;
     if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) return;
-    const saved = (yield* SubscriptionRef.get(entries)).get(environmentId);
+    const savedEntry = (yield* SubscriptionRef.get(entries)).get(environmentId);
+    const saved = savedEntry?.target._tag === "LinkedConnectionTarget" ? undefined : savedEntry;
     if (
       saved !== undefined &&
       findRouteToSameAddress(connectionRoutes(saved), route) === undefined
@@ -583,7 +588,7 @@ export const make = Effect.gen(function* () {
         }
         const previous = (yield* SubscriptionRef.get(entries)).get(environmentId);
         let entry = registered;
-        if (previous !== undefined) {
+        if (previous !== undefined && previous.target._tag !== "LinkedConnectionTarget") {
           const existing = connectionRoutes(previous);
           const sameAddress = findRouteToSameAddress(existing, route);
           const routes = existing.filter(
@@ -603,6 +608,19 @@ export const make = Effect.gen(function* () {
         );
         yield* installEntryLocked(entry);
         return true;
+      }),
+    );
+  });
+
+  const registerLinked = Effect.fn("EnvironmentRegistry.registerLinked")(function* (
+    target: LinkedConnectionTarget,
+  ) {
+    yield* withLeaseLock(
+      target.environmentId,
+      Effect.gen(function* () {
+        const previous = (yield* SubscriptionRef.get(entries)).get(target.environmentId);
+        if (previous !== undefined && previous.target._tag !== "LinkedConnectionTarget") return;
+        yield* installEntryLocked({ target, profile: Option.none(), enabled: true });
       }),
     );
   });
@@ -942,7 +960,8 @@ export const make = Effect.gen(function* () {
           return Option.none<ConnectionCatalogEntry>();
         }
         const entry = (yield* SubscriptionRef.get(entries)).get(input.environmentId);
-        if (entry === undefined) return Option.none<ConnectionCatalogEntry>();
+        if (entry === undefined || entry.target._tag === "LinkedConnectionTarget")
+          return Option.none<ConnectionCatalogEntry>();
         const routes = mergeLearnedRoutes({
           entry,
           activeRoute: input.activeRoute,
@@ -1082,7 +1101,10 @@ export const make = Effect.gen(function* () {
         if (entry.enabled === enabled && !retryUnsupported) {
           return;
         }
-        if (!(yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
+        if (
+          entry.target._tag !== "LinkedConnectionTarget" &&
+          !(yield* Ref.get(platformEnvironmentIds)).has(environmentId)
+        ) {
           yield* registrations.setEnabled(environmentId, enabled);
         }
         // A cached rejection can outlive a server update.
@@ -1199,6 +1221,7 @@ export const make = Effect.gen(function* () {
     networkStatus,
     start,
     register,
+    registerLinked,
     assertKnownAddress,
     reconcilePlatform,
     remove,

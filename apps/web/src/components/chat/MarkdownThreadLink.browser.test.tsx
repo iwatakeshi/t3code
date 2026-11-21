@@ -7,6 +7,10 @@ import { expect, it, vi } from "vite-plus/test";
 import { act, render } from "../../../test/render";
 import { MarkdownThreadLink } from "./MarkdownThreadLink";
 
+vi.mock(import("../../state/peerLinks"), () => ({
+  useOpenLinkedConversation: () => ({ openConversation: async () => true, opening: false }),
+}));
+
 const state = vi.hoisted(() => ({
   reply: null as unknown,
   remote: null as unknown,
@@ -38,6 +42,7 @@ vi.mock(import("../contextChipParts"), () => ({
   UnresolvedChip: ({ label }: { label: string }) => <span>{label}</span>,
 }));
 vi.mock(import("../../state/orchestration"), () => ({
+  threadTitlesRead: {} as never,
   orchestrationEnvironment: { threadLinkMetadata: () => state.reply } as never,
 }));
 
@@ -144,7 +149,7 @@ it.each([
   },
 );
 
-it("names a thread on a machine this client has no connection to, without waiting on it", async () => {
+it("offers a linked thread without a direct connection or an eager remote read", async () => {
   const { registry } = setup();
   using _registry = { [Symbol.dispose]: () => registry.dispose() };
   await using screen = await render(
@@ -157,7 +162,6 @@ it("names a thread on a machine this client has no connection to, without waitin
     </RegistryContext>,
   );
   await expect
-    .element(screen.getByText("Thread on another machine", { exact: true }))
+    .element(screen.getByRole("link", { name: "Thread, Thread", exact: true }))
     .toBeVisible();
-  await expect.element(screen.getByRole("link")).not.toBeInTheDocument();
 });

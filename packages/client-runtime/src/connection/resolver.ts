@@ -1,3 +1,4 @@
+import * as Redacted from "effect/Redacted";
 import { msg } from "gt-i18n";
 import { translatableDetail } from "../errors/translatable.ts";
 import type {
@@ -285,6 +286,7 @@ export const make = Effect.gen(function* () {
   const relay = yield* makeRelayBroker();
   const ssh = yield* makeSshBroker();
   const httpClient = yield* HttpClient.HttpClient;
+  const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
 
   const authorize = Effect.fn("clientRuntime.connection.broker.authorize")(function* (
     entry: ConnectionCatalogEntry,
@@ -300,6 +302,16 @@ export const make = Effect.gen(function* () {
       switch (target._tag) {
         case "PrimaryConnectionTarget":
           return primary(target);
+        case "LinkedConnectionTarget":
+          return remote
+            .authorizeBearer({
+              expectedEnvironmentId: target.environmentId,
+              httpBaseUrl: target.httpBaseUrl,
+              wsBaseUrl: target.wsBaseUrl,
+              bearerToken: Redacted.value(target.token),
+              connectionMethod: "direct",
+            })
+            .pipe(Effect.map((prepared) => ({ ...prepared, target })));
         case "BearerConnectionTarget":
           return bearer({ ...entry, target });
         case "RelayConnectionTarget":

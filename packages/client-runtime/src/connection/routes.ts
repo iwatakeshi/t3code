@@ -17,6 +17,7 @@ import { mFallback, msg } from "gt-i18n";
 import type { MFunctionType } from "gt-i18n/types";
 
 export type ConnectionRouteKind =
+  | "linked"
   | "relay"
   | "loopback"
   | "lan"
@@ -31,6 +32,8 @@ export function connectionRouteId(target: ConnectionTarget): string {
   switch (target._tag) {
     case "PrimaryConnectionTarget":
       return "primary";
+    case "LinkedConnectionTarget":
+      return "linked";
     case "RelayConnectionTarget":
       return RELAY_ROUTE_ID;
     case "BearerConnectionTarget":
@@ -68,7 +71,11 @@ export function routeEntry(
 }
 
 export function routeHttpBaseUrl(route: ConnectionRoute): string | null {
-  if (route.target._tag === "PrimaryConnectionTarget") return route.target.httpBaseUrl;
+  if (
+    route.target._tag === "PrimaryConnectionTarget" ||
+    route.target._tag === "LinkedConnectionTarget"
+  )
+    return route.target.httpBaseUrl;
   const profile = Option.getOrNull(route.profile);
   return profile?._tag === "BearerConnectionProfile" ? profile.httpBaseUrl : null;
 }
@@ -94,6 +101,8 @@ export function connectionRouteKind(route: ConnectionRoute): ConnectionRouteKind
   switch (route.target._tag) {
     case "RelayConnectionTarget":
       return "relay";
+    case "LinkedConnectionTarget":
+      return "linked";
     case "SshConnectionTarget":
       return "ssh";
     case "PrimaryConnectionTarget":
@@ -138,6 +147,7 @@ const ROUTE_KIND_RANK: Record<ConnectionRouteKind, number> = {
   public: 3,
   ssh: 4,
   relay: 5,
+  linked: 6,
 };
 
 export function insertRoute(
@@ -195,6 +205,8 @@ export function connectionRouteLabel(route: ConnectionRoute): string {
   switch (connectionRouteKind(route)) {
     case "relay":
       return T3_CONNECT_NAME;
+    case "linked":
+      return msg("Linked environment");
     case "loopback":
       return msg("This device");
     case "lan":

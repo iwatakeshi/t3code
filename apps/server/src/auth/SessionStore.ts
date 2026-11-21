@@ -22,6 +22,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Option from "effect/Option";
 
+import { conversationParentSession } from "../peer/PeerConversationAccess.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
@@ -617,6 +618,39 @@ const make = Effect.gen(function* () {
       sessionId,
     }).pipe(Effect.asVoid);
 
+  const verifyConversationParent = Effect.fn("SessionStore.verifyConversationParent")(function* (
+    subject: string,
+  ) {
+    let sessionId = conversationParentSession(subject);
+    while (sessionId !== undefined) {
+      const parentSessionId = sessionId;
+      const parent = yield* authSessions
+        .getById({ sessionId: parentSessionId })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new SessionCredentialVerificationError({ sessionId: parentSessionId, cause }),
+          ),
+        );
+      if (Option.isNone(parent)) return yield* new UnknownSessionTokenError({ sessionId });
+      if (parent.value.revokedAt !== null) {
+        return yield* new SessionTokenRevokedError({
+          sessionId,
+          revokedAt: parent.value.revokedAt,
+        });
+      }
+      const observedAt = yield* DateTime.now;
+      if (parent.value.expiresAt.epochMilliseconds <= observedAt.epochMilliseconds) {
+        return yield* new SessionTokenExpiredError({
+          sessionId,
+          expiresAt: parent.value.expiresAt,
+          observedAt,
+        });
+      }
+      sessionId = conversationParentSession(parent.value.subject);
+    }
+  });
+
   const loadActiveSession = Effect.fn("SessionStore.loadActiveSession")(function* (
     sessionId: AuthSessionId,
   ) {
@@ -920,6 +954,7 @@ const make = Effect.gen(function* () {
         });
       }
 
+      yield* verifyConversationParent(row.value.subject);
       return {
         sessionId: claims.sid,
         token,
@@ -1142,6 +1177,7 @@ const make = Effect.gen(function* () {
       });
     }
 
+    yield* verifyConversationParent(row.value.subject);
     return {
       sessionId: row.value.sessionId,
       token,
@@ -1257,7 +1293,7 @@ const make = Effect.gen(function* () {
     return revokedSessionIds.length;
   });
 
-  const awaitInvalidation = Effect.fn(function* (
+  const awaitSessionInvalidation = Effect.fn(function* (
     sessionId: AuthSessionId,
     proofKeyThumbprint?: string,
   ) {
@@ -1336,6 +1372,19 @@ const make = Effect.gen(function* () {
         }
       }),
     );
+  });
+
+  const awaitInvalidation: SessionStore["Service"]["awaitInvalidation"] = Effect.fn(
+    "SessionStore.awaitInvalidation",
+  )(function* (sessionId, proofKeyThumbprint) {
+    const row = yield* authSessions
+      .getById({ sessionId })
+      .pipe(
+        Effect.mapError((cause) => new SessionCredentialVerificationError({ sessionId, cause })),
+      );
+    const parent = Option.isSome(row) ? conversationParentSession(row.value.subject) : undefined;
+    const own = awaitSessionInvalidation(sessionId, proofKeyThumbprint);
+    return yield* parent === undefined ? own : Effect.raceFirst(own, awaitInvalidation(parent));
   });
 
   return SessionStore.of({

@@ -149,3 +149,12 @@ export class PeerLinkRequestError extends Schema.TaggedError<PeerLinkRequestErro
     return PEER_LINK_REQUEST_FAILURE_MESSAGES[this.reason];
   }
 }
+
+export const PeerConversationOpenInput = Schema.Struct({ environmentId: EnvironmentId });
+export const PeerConversationConnection = Schema.Struct({
+  environmentId: EnvironmentId,
+  label: Schema.String,
+  routeId: Schema.String,
+  token: Schema.RedactedFromValue(Schema.String),
+});
+export type PeerConversationConnection = typeof PeerConversationConnection.Type;

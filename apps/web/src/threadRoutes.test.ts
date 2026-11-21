@@ -128,6 +128,16 @@ describe("threadRoutes", () => {
         bootstrapComplete: false,
         serverThreadExists: false,
         serverThreadDeleted: false,
+        unlistedThreadDetail: EMPTY_ENVIRONMENT_THREAD_STATE,
+        draftThreadExists: false,
+        environmentUnavailable: true,
+      }),
+    ).toBe("unavailable");
+    expect(
+      resolveThreadRouteRenderState({
+        bootstrapComplete: false,
+        serverThreadExists: false,
+        serverThreadDeleted: false,
         unlistedThreadDetail: { ...EMPTY_ENVIRONMENT_THREAD_STATE, status: "deleted" },
         draftThreadExists: false,
       }),

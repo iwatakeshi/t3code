@@ -1,3 +1,4 @@
+import { environmentBasePath } from "../environment/endpoint.ts";
 import { MarkedText, markedTextEnglish, translatableMessage } from "../errors/translatable.ts";
 import { msg } from "gt-i18n";
 import {
@@ -107,7 +108,7 @@ export const layerRemoteHttpClient = (
 
 const remoteApiBaseUrl = (httpBaseUrl: string): string => {
   const url = new URL(httpBaseUrl);
-  url.pathname = "/";
+  url.pathname = `${environmentBasePath(httpBaseUrl)}/`;
   url.search = "";
   url.hash = "";
   return url.toString();

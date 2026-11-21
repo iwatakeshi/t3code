@@ -4,12 +4,17 @@ import { parseThreadKey, threadKey } from "@t3tools/client-runtime/state/entitie
 import { visibilityParentKey } from "@t3tools/client-runtime/state/threads";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import * as Option from "effect/Option";
-import { Navigate, useNavigate } from "@tanstack/react-router";
+import { Link, Navigate, useNavigate } from "@tanstack/react-router";
+import { useGT, useMessages } from "gt-react";
+import { connectionStatusText } from "@t3tools/client-runtime/connection";
 import { useEffect, useState } from "react";
 
 import ChatView from "./ChatView";
 import { BackgroundThreadContext, HiddenThreadContext } from "./chat/backgroundThread";
 import { SidebarInset } from "./ui/sidebar";
+import { Button } from "./ui/button";
+import { Empty, EmptyHeader, EmptyTitle, EmptyDescription, EmptyContent } from "./ui/empty";
+import { useEnvironments } from "../state/environments";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useSidebarPendingFileDropStore } from "../sidebarPendingFileDropStore";
 import {
@@ -59,6 +64,8 @@ export function ThreadRouteView({
   background?: boolean;
 }) {
   const navigate = useNavigate();
+  const gt = useGT();
+  const messages = useMessages();
   const draftId = target.kind === "draft" ? target.draftId : null;
   const draftSession = useComposerDraftStore((store) =>
     draftId === null ? null : store.getDraftSession(draftId),
@@ -67,6 +74,10 @@ export function ThreadRouteView({
     draftId === null ? null : store.getPromotedDraftRedirect(draftId),
   );
   const serverThreadRef = target.kind === "server" ? target.threadRef : null;
+  const { presentationById, isReady: environmentsReady } = useEnvironments();
+  const environment = serverThreadRef
+    ? presentationById.get(serverThreadRef.environmentId)
+    : undefined;
   const serverThreadShell = useQuietThreadShell(serverThreadRef);
   const shellStatus = useEnvironmentShellStatus(serverThreadRef?.environmentId ?? null);
   const environmentThreadRefs = useEnvironmentThreadRefs(serverThreadRef?.environmentId ?? null);
@@ -137,6 +148,11 @@ export function ThreadRouteView({
     serverThreadDeleted: serverThreadShell?.deletedAt != null,
     unlistedThreadDetail,
     draftThreadExists: draftThread !== null,
+    environmentUnavailable:
+      environmentsReady &&
+      (environment === undefined ||
+        (environment.entry.target._tag === "LinkedConnectionTarget" &&
+          environment.connection.phase !== "connected")),
   });
   const environmentHasAnyThreads = environmentThreadRefs.length > 0 || environmentHasDraftThreads;
 
@@ -208,6 +224,24 @@ export function ThreadRouteView({
     } else {
       redirect = <Navigate to="/" replace />;
     }
+  } else if (renderState === "unavailable") {
+    view = (
+      <Empty>
+        <EmptyHeader>
+          <EmptyTitle>{gt("Environment unavailable")}</EmptyTitle>
+          <EmptyDescription>
+            {environment
+              ? connectionStatusText(environment.connection, messages)
+              : gt("Could not open conversation")}
+          </EmptyDescription>
+        </EmptyHeader>
+        <EmptyContent>
+          <Button variant="outline" render={<Link to="/" />}>
+            {gt("Threads")}
+          </Button>
+        </EmptyContent>
+      </Empty>
+    );
   } else if (hiddenByTagFilter) {
     redirect = <Navigate to="/" replace />;
   } else if (offShellBlocked) {

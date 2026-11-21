@@ -1,3 +1,4 @@
+import { environmentCatalog } from "../connection/catalog";
 import { sessionHasLegacyPermissions, type EnvironmentId } from "@t3tools/contracts";
 import type { AnyRouter } from "@tanstack/react-router";
 import { msg } from "gt-react";
@@ -19,6 +20,11 @@ interface LegacyPermissionEnvironment {
 /** Environments whose settled session still carries pre-scope permissions. */
 const legacyPermissionEnvironmentsAtom = Atom.make((get) =>
   get(environmentSummaries.identitiesAtom).filter(({ environmentId }) => {
+    if (
+      get(environmentCatalog.catalogValueAtom).entries.get(environmentId)?.target._tag ===
+      "LinkedConnectionTarget"
+    )
+      return false;
     const session = get(environmentSession.sessionStateAtom(environmentId));
     return (
       session._tag === "Success" && !session.waiting && sessionHasLegacyPermissions(session.value)

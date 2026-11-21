@@ -4160,7 +4160,6 @@
   "309b160785f6c473": "Open fork in this chat",
   "6676cd4b8299663f": "Open parent thread in this chat",
   "63e8c7a0ef0513b5": "Related threads",
-  "68060b380fe53942": "Runs on {label}. Connect to it to open the thread there.",
   "9996d9dac573001a": "Open on {label}",
   "15a601a94893277f": "Could not open the parent thread",
   "5eb43f554a5b7a58": "The parent thread was deleted",
@@ -12205,5 +12204,8 @@
   "27d76249d09eb69f": "Review guide ready",
   "faa3bb26abb39c93": "Review guide failed",
   "b7df38b7d8792d78": "Open guide",
-  "9e91e9a77b664e4e": "Could not start a review guide"
+  "9e91e9a77b664e4e": "Could not start a review guide",
+  "f38f3c17a01c7093": "Linked environment",
+  "8133f1bc777e09d9": "Opening conversation…",
+  "a68d753aed6a7895": "Could not open conversation"
 }

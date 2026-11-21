@@ -1,3 +1,4 @@
+import * as Redacted from "effect/Redacted";
 import {
   AuthEnvironmentMaintainScope,
   AuthDiagnosticsReadScope,
@@ -5,11 +6,13 @@ import {
   AuthProvidersManageScope,
   AuthSettingsWriteScope,
   AuthAccessWriteScope,
+  AuthAccessReadScope,
   DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
   ProviderInstanceId,
   ProjectId,
   IssueTrackerKind,
+  EnvironmentId,
   SecretProviderId,
   ThreadId,
   AuthOrchestrationOperateScope,
@@ -149,6 +152,47 @@ describe("RPC scope middleware", () => {
     }),
   );
 });
+
+it.effect("requires access to links before opening a linked conversation", () =>
+  Effect.gen(function* () {
+    const method = WS_METHODS.peerLinksOpenConversation;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof method> => tag !== method,
+      ),
+    );
+    const handled: string[] = [];
+    const handlers = group.toLayerHandler(method, ({ environmentId }) =>
+      Effect.sync(() => {
+        handled.push(environmentId);
+        return {
+          environmentId,
+          label: "Worker",
+          routeId: "route",
+          token: Redacted.make("scoped-grant"),
+        };
+      }),
+    );
+    const request = { environmentId: EnvironmentId.make("worker") };
+    const denied = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(Layer.merge(handlers, RpcAuthorization.layer([AuthOrchestrationReadScope]))),
+    );
+    expect(yield* denied[method](request).pipe(Effect.flip)).toMatchObject({
+      requiredPermission: AuthAccessReadScope,
+    });
+    expect(handled).toEqual([]);
+    const allowed = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.merge(
+          handlers,
+          RpcAuthorization.layer([AuthAccessReadScope, AuthOrchestrationReadScope]),
+        ),
+      ),
+    );
+    yield* allowed[method](request);
+    expect(handled).toEqual([request.environmentId]);
+  }).pipe(Effect.scoped),
+);
 
 it.effect("allows issue reads but requires a source-control grant before commenting", () =>
   Effect.gen(function* () {

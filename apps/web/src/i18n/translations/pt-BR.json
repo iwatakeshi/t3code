@@ -4158,7 +4158,6 @@
   "309b160785f6c473": "Abrir o fork neste chat",
   "6676cd4b8299663f": "Abrir a thread principal neste chat",
   "63e8c7a0ef0513b5": "Threads relacionadas",
-  "68060b380fe53942": "Roda em {label}. Conecte-se a ele para abrir a thread lá.",
   "9996d9dac573001a": "Abrir em {label}",
   "15a601a94893277f": "Não foi possível abrir a thread principal",
   "5eb43f554a5b7a58": "A thread principal foi excluída",
@@ -12195,5 +12194,8 @@
   "27d76249d09eb69f": "Guia de revisão pronto",
   "faa3bb26abb39c93": "O guia de revisão falhou",
   "b7df38b7d8792d78": "Abrir guia",
-  "9e91e9a77b664e4e": "Não foi possível iniciar um guia de revisão"
+  "9e91e9a77b664e4e": "Não foi possível iniciar um guia de revisão",
+  "f38f3c17a01c7093": "Ambiente vinculado",
+  "8133f1bc777e09d9": "Abrindo conversa…",
+  "a68d753aed6a7895": "Não foi possível abrir a conversa"
 }

@@ -157,6 +157,7 @@ export function environmentMcpUrl(input: {
   readonly relayHttpBaseUrl?: string | undefined;
   readonly connectedTarget?: ConnectionTarget | null | undefined;
 }): string | null {
+  if (input.entry.target._tag === "LinkedConnectionTarget") return null;
   const relayMcpUrl = input.relayHttpBaseUrl ? mcpUrlFromBase(input.relayHttpBaseUrl) : null;
   if (relayMcpUrl !== null) return relayMcpUrl;
   const connectedRouteId = input.connectedTarget ? connectionRouteId(input.connectedTarget) : null;
@@ -188,6 +189,7 @@ function mcpUrlFromBase(httpBaseUrl: string): string | null {
 export function connectionCatalogDisplayUrl(entry: ConnectionCatalogEntry): string | null {
   switch (entry.target._tag) {
     case "PrimaryConnectionTarget":
+    case "LinkedConnectionTarget":
       return entry.target.httpBaseUrl;
     case "RelayConnectionTarget":
       return null;

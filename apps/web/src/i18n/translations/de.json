@@ -4161,7 +4161,6 @@
   "309b160785f6c473": "Fork in diesem Chat öffnen",
   "6676cd4b8299663f": "Übergeordneten Thread in diesem Chat öffnen",
   "63e8c7a0ef0513b5": "Verwandte Threads",
-  "68060b380fe53942": "Läuft auf {label}. Verbinde dich damit, um den Thread dort zu öffnen.",
   "9996d9dac573001a": "Auf {label} öffnen",
   "15a601a94893277f": "Der übergeordnete Thread konnte nicht geöffnet werden",
   "5eb43f554a5b7a58": "Der übergeordnete Thread wurde gelöscht",
@@ -12196,5 +12195,8 @@
   "27d76249d09eb69f": "Review-Leitfaden bereit",
   "faa3bb26abb39c93": "Review-Leitfaden fehlgeschlagen",
   "b7df38b7d8792d78": "Leitfaden öffnen",
-  "9e91e9a77b664e4e": "Review-Leitfaden konnte nicht gestartet werden"
+  "9e91e9a77b664e4e": "Review-Leitfaden konnte nicht gestartet werden",
+  "f38f3c17a01c7093": "Verknüpfte Umgebung",
+  "8133f1bc777e09d9": "Unterhaltung wird geöffnet…",
+  "a68d753aed6a7895": "Unterhaltung konnte nicht geöffnet werden"
 }

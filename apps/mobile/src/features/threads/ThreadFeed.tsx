@@ -1,3 +1,5 @@
+import { orchestrationEnvironment } from "../../state/orchestration";
+import { useOpenLinkedConversation } from "../../state/peerLinks";
 import { CollapsibleUserMessageBody } from "./CollapsibleUserMessageBody";
 import { msg, T, useGT, useLocale, useMessages } from "gt-react-native";
 import { m } from "../../i18n/messages";
@@ -85,7 +87,11 @@ import {
 } from "@t3tools/contracts";
 import type { ToolCallVisibility } from "@t3tools/contracts/settings";
 import { encodeComposerContextFragment } from "@t3tools/shared/composerContextClipboard";
-import { hostedThreadLink, parseThreadLinkHref } from "@t3tools/shared/threadLinks";
+import {
+  hostedThreadLink,
+  parseThreadLinkHref,
+  threadLinkCandidates,
+} from "@t3tools/shared/threadLinks";
 import { PROMPT_LINK_MAX_PROMPT_LENGTH } from "@t3tools/shared/promptLinks";
 import {
   parseComposerContextHref,
@@ -3289,6 +3295,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       path: fileRoutePathSegments(path),
     });
   };
+  const { openConversation } = useOpenLinkedConversation(props.environmentId);
   const resolveLinkedThread = (href: string) => {
     const link = parseThreadLinkHref(href);
     if (!link) return null;
@@ -3434,12 +3441,37 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       );
       return;
     }
-    if (parseThreadLinkHref(href)) {
+    const threadLink = parseThreadLinkHref(href);
+    if (threadLink) {
       const target = resolveLinkedThread(href);
       if (target) {
-        openLinkedThread({
-          environmentId: String(target.environmentId),
-          threadId: String(target.threadId),
+        void openConversation(target).then(async (opened) => {
+          if (!opened || request.signal.aborted) return;
+          const candidates = threadLinkCandidates(threadLink, props.environmentId);
+          const metadata = await executeAtomQuery(
+            appAtomRegistry,
+            orchestrationEnvironment.threadLinkMetadata({
+              environmentId: target.environmentId,
+              input: { threadIds: candidates.map((candidate) => candidate.threadId) },
+            }),
+            { reportFailure: false },
+          );
+          if (request.signal.aborted) return;
+          if (metadata._tag === "Failure") {
+            Dialog.alert(gt("Could not open conversation"));
+            return;
+          }
+          const found = candidates.find(
+            (candidate) => metadata.value[candidate.threadId] !== undefined,
+          );
+          if (found === undefined) {
+            Dialog.alert(gt("Thread no longer available"));
+            return;
+          }
+          openLinkedThread({
+            environmentId: String(target.environmentId),
+            threadId: String(found.threadId),
+          });
         });
       }
       return;

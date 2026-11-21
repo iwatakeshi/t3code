@@ -1,5 +1,8 @@
+import { useAtomCommand } from "~/state/use-atom-command";
+import { toastManager } from "./ui/toast";
+import { useOpenLinkedConversation } from "~/state/peerLinks";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
-import type { ThreadContextRecord, ProjectId } from "@t3tools/contracts";
+import type { ThreadContextRecord, ProjectId, EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { MessagesSquareIcon } from "lucide-react";
 import { useGT } from "gt-react";
@@ -7,7 +10,7 @@ import { useGT } from "gt-react";
 import { resolveThreadOpenRoute } from "~/lib/sideChatPane";
 import { buildThreadRouteParams } from "~/threadRoutes";
 import { useProject, useThreadShell } from "~/state/entities";
-import { orchestrationEnvironment } from "~/state/orchestration";
+import { threadTitlesRead, orchestrationEnvironment } from "~/state/orchestration";
 import { useEnvironmentQuery } from "~/state/query";
 import { ContextChip, ContextChipLabel } from "./ContextChip";
 import { ProjectFavicon } from "./ProjectFavicon";
@@ -18,9 +21,15 @@ export function ThreadContextChip(props: {
   projectId?: ProjectId | null;
   copyMarkdown?: string;
   unreadable?: boolean;
+  coordinatorId?: EnvironmentId;
+  candidateThreadIds?: readonly ThreadId[];
 }) {
   const gt = useGT();
+  const readTitles = useAtomCommand(threadTitlesRead, { reportFailure: false });
   const { environmentId, threadId } = props.record;
+  const { openConversation, opening } = useOpenLinkedConversation(
+    props.coordinatorId ?? environmentId,
+  );
   const shell = useThreadShell({ environmentId, threadId });
   const lookup = useEnvironmentQuery(
     shell === null && props.projectId === undefined
@@ -41,12 +50,36 @@ export function ThreadContextChip(props: {
         render={
           <ContextChip
             kind="thread"
+            aria-busy={opening || undefined}
             {...(props.unreadable ? { state: "invalid" as const } : {})}
             render={
               <Link
                 to="/$environmentId/$threadId"
                 params={{ environmentId, threadId }}
-                onClick={(event) => {
+                onClick={async (event) => {
+                  if (props.coordinatorId !== undefined && props.coordinatorId !== environmentId) {
+                    event.preventDefault();
+                    if (!(await openConversation({ environmentId, threadId }))) return;
+                    const candidates = props.candidateThreadIds ?? [threadId];
+                    const titles = await readTitles({
+                      environmentId,
+                      input: { threadIds: candidates },
+                    });
+                    if (titles._tag === "Failure") {
+                      toastManager.add({ type: "error", title: gt("Could not open conversation") });
+                      return;
+                    }
+                    const found = candidates.find((id) => titles.value[id] !== undefined);
+                    if (found === undefined) {
+                      toastManager.add({ type: "info", title: gt("Thread no longer available") });
+                      return;
+                    }
+                    void navigate({
+                      to: "/$environmentId/$threadId",
+                      params: { environmentId, threadId: found },
+                    });
+                    return;
+                  }
                   if (shell?.lineage.sideChat !== true || event.button !== 0) return;
                   if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
                   // A side chat opens as a tab beside its parent, not as its own page.
@@ -70,7 +103,7 @@ export function ThreadContextChip(props: {
             ) : (
               <MessagesSquareIcon />
             )}
-            <ContextChipLabel>{title}</ContextChipLabel>
+            <ContextChipLabel>{opening ? gt("Opening conversation…") : title}</ContextChipLabel>
           </ContextChip>
         }
       />

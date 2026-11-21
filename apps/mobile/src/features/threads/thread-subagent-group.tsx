@@ -27,7 +27,7 @@ import type { ThreadFeedActivity } from "../../lib/threadActivity";
 import { serverEnvironment } from "../../state/server";
 import { environmentThreadDetails } from "../../state/threads";
 import { subagentCardElapsed } from "./subagent-card-presentation";
-import { useEnvironments } from "../../state/environments";
+import { useOpenLinkedConversation } from "../../state/peerLinks";
 import { useServerConfigs } from "../../state/entities";
 import { SubagentRow } from "./SubagentRow";
 import { useVisibleSecondClock } from "./use-visible-second-clock";
@@ -121,7 +121,7 @@ export function ThreadSubagentGroup(props: {
     environmentThreadDetails.threadAtom(scopeThreadRef(props.environmentId, members[0]!.threadId)),
     (thread) => thread?.projection.subagents,
   );
-  const { presentationById } = useEnvironments();
+  const { openConversation, opening } = useOpenLinkedConversation(props.environmentId);
   const agents = members.map((item) => {
     const live = liveAgents?.find((agent) => agent.id === item.subagentId);
     return {
@@ -199,10 +199,7 @@ export function ThreadSubagentGroup(props: {
       {!grouped || expanded ? (
         <View className="mb-1 gap-px rounded-xl border border-border bg-card/30 p-1">
           {agents.map((agent) => {
-            // A task in a linked environment opens there, if this app is connected to it.
-            const target = subagentThreadTarget(agent, props.environmentId, (id) =>
-              presentationById.has(id),
-            );
+            const target = subagentThreadTarget(agent, props.environmentId, () => true);
             return (
               <Pressable
                 key={agent.item.id}
@@ -215,9 +212,15 @@ export function ThreadSubagentGroup(props: {
                       ? gt("Runs on {label}", { label: agent.remoteChild.label })
                       : gt("Provider-managed agent")
                 }
-                disabled={target === null}
-                onPress={() => {
+                disabled={target === null || opening}
+                accessibilityState={{ busy: opening }}
+                onPress={async () => {
                   if (target === null) return;
+                  if (
+                    target.environmentId !== props.environmentId &&
+                    !(await openConversation(target))
+                  )
+                    return;
                   if (
                     openInspector(
                       { environmentId: props.environmentId, threadId: members[0]!.threadId },

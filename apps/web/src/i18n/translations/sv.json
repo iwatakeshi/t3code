@@ -4159,7 +4159,6 @@
   "309b160785f6c473": "Öppna forken i den här chatten",
   "6676cd4b8299663f": "Öppna den överordnade tråden i den här chatten",
   "63e8c7a0ef0513b5": "Relaterade trådar",
-  "68060b380fe53942": "Körs på {label}. Anslut till den för att öppna tråden där.",
   "9996d9dac573001a": "Öppna på {label}",
   "15a601a94893277f": "Kunde inte öppna den överordnade tråden",
   "5eb43f554a5b7a58": "Den överordnade tråden togs bort",
@@ -12203,5 +12202,8 @@
   "27d76249d09eb69f": "Granskningsguiden är klar",
   "faa3bb26abb39c93": "Granskningsguiden misslyckades",
   "b7df38b7d8792d78": "Öppna guiden",
-  "9e91e9a77b664e4e": "Kunde inte starta en granskningsguide"
+  "9e91e9a77b664e4e": "Kunde inte starta en granskningsguide",
+  "f38f3c17a01c7093": "Länkad miljö",
+  "8133f1bc777e09d9": "Öppnar konversation…",
+  "a68d753aed6a7895": "Kunde inte öppna konversationen"
 }

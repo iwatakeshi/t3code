@@ -1,3 +1,6 @@
+import { useRouter } from "@tanstack/react-router";
+import { useGT, useMessages } from "gt-react";
+import { toastManager } from "../components/ui/toast";
 import { useAtomValue } from "@effect/atom-react";
 import {
   linkableMachines,
@@ -5,15 +8,15 @@ import {
   offersLinkedEnvironments,
 } from "@t3tools/client-runtime/link-request";
 import { createPeerLinkEnvironmentAtoms } from "@t3tools/client-runtime/state/peerLinks";
-import { AuthAccessReadScope, type EnvironmentId } from "@t3tools/contracts";
+import { AuthAccessReadScope, type EnvironmentId, type ThreadId } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
-import { useEffect, useEffectEvent } from "react";
+import { useEffect, useEffectEvent, useState } from "react";
 
 import { connectionAtomRuntime } from "../connection/runtime";
-import { useEnvironmentIdentities, useEnvironments } from "./environments";
+import { readEnvironment, useEnvironmentIdentities, useEnvironments } from "./environments";
 import { environmentPresentations } from "./presentation";
 import { relayEnvironmentDiscovery } from "./relay";
-import { useEnvironmentQuery } from "./query";
+import { formatEnvironmentQueryError, useEnvironmentQuery } from "./query";
 import { useEnvironmentsWithScope } from "./session";
 import { useAtomCommand } from "./use-atom-command";
 
@@ -91,4 +94,39 @@ export function useLinkableMachines(environmentId: EnvironmentId, enabled: boole
     links: links.data?.links ?? [],
     connect: discovery.environments,
   });
+}
+
+export function useOpenLinkedConversation(coordinatorId: EnvironmentId) {
+  const command = useAtomCommand(peerLinkEnvironment.openConversation, { reportFailure: false });
+  const [opening, setOpening] = useState(false);
+  const router = useRouter();
+  const gt = useGT();
+  const messages = useMessages();
+  const openConversation = async (target: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+  }) => {
+    const environment = readEnvironment(target.environmentId);
+    if (
+      environment !== null &&
+      (environment.entry.target._tag !== "LinkedConnectionTarget" ||
+        environment.connection.phase === "connected")
+    )
+      return true;
+    const location = router.latestLocation;
+    setOpening(true);
+    const result = await command({ environmentId: coordinatorId, input: target });
+    setOpening(false);
+    if (router.latestLocation !== location) return false;
+    if (result._tag === "Failure") {
+      toastManager.add({
+        type: "error",
+        title: gt("Could not open conversation"),
+        description: formatEnvironmentQueryError(result.cause, messages),
+      });
+      return false;
+    }
+    return true;
+  };
+  return { openConversation, opening };
 }

@@ -201,6 +201,36 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("SessionStore.lay
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
   );
 
+  it.effect(
+    "rejects conversation credentials and closes their sockets when the peer link is revoked",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* SessionStore.SessionStore;
+        const peer = yield* sessions.issue({
+          subject: "mcp-client",
+          method: "bearer-access-token",
+        });
+        const child = yield* sessions.issue({
+          subject: `peer-conversation:${peer.sessionId}`,
+          method: "bearer-access-token",
+        });
+        const grandchild = yield* sessions.issue({
+          subject: `peer-conversation:${child.sessionId}`,
+        });
+        const ticket = yield* sessions.issueWebSocketToken(child.sessionId);
+        const watcher = yield* sessions
+          .awaitInvalidation(child.sessionId)
+          .pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* sessions.revoke(peer.sessionId);
+        expect((yield* Effect.result(sessions.verify(grandchild.token)))._tag).toBe("Failure");
+        expect((yield* Effect.result(sessions.verify(child.token)))._tag).toBe("Failure");
+        expect((yield* Effect.result(sessions.verifyWebSocketToken(ticket.token)))._tag).toBe(
+          "Failure",
+        );
+        yield* Fiber.join(watcher);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(layerSessionStore(), TestClock.layer()))),
+  );
+
   it.effect("keeps a socket on a session renewed in place until its moved deadline", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;

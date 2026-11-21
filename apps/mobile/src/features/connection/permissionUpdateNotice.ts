@@ -16,6 +16,7 @@ const storageKey = "t3code.permission-update.v1";
 const legacyPermissionEnvironmentsAtom = Atom.make((get) =>
   [...get(environmentPresentations.presentationsAtom).entries()].flatMap(
     ([environmentId, presentation]) => {
+      if (presentation.entry.target._tag === "LinkedConnectionTarget") return [];
       const session = get(environmentSession.sessionStateAtom(environmentId));
       return session._tag === "Success" &&
         !session.waiting &&

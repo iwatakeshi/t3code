@@ -157,7 +157,18 @@ it.effect("routes peer reads to readers and sees uncommitted link updates", () =
         expect((yield* links.list)[0]?.label).toBe("Uncommitted box");
       }),
     );
+    const linkedAt = Option.getOrThrow(yield* links.get(box.environmentId)).linkedAt;
+    const invalidated = yield* Deferred.make<void>();
+    yield* links
+      .awaitInvalidation(box.environmentId, linkedAt)
+      .pipe(
+        Effect.andThen(Deferred.succeed(invalidated, undefined)),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+    expect(yield* Deferred.isDone(invalidated)).toBe(false);
     expect(yield* links.unlink(box.environmentId)).toBe(true);
+    yield* Deferred.await(invalidated);
+    yield* links.awaitInvalidation(box.environmentId, linkedAt);
     expect(yield* links.list).toEqual([]);
   }),
 );

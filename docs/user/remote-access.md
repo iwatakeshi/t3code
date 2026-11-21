@@ -435,6 +435,13 @@ from that machine's **Settings → Sharing & access**. An address you type alway
 needs a pasted code. From a terminal, use
 `t3 environment link <address> --pairing-code <code> --access <mode>`.
 
+Open a delegated task or its result link to read its conversation in the current app.
+If this app is not paired directly with the worker, it connects through the machine
+that delegated the task. A full-access link lets you send messages, answer requests,
+and stop work when your own session also allows it. Other link modes open the normal
+conversation with read-only access. Removing the link closes conversations using it.
+After reloading the app, reopen the worker conversation from its parent to reconnect.
+
 To link many machines at once, choose **Link several…** (it appears once this
 app has two other machines saved). Tick the machines, pick one access level for
 all of them, and confirm once. A machine can be ticked when this app is

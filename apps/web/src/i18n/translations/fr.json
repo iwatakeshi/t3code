@@ -4159,7 +4159,6 @@
   "309b160785f6c473": "Ouvrir le fork dans cette discussion",
   "6676cd4b8299663f": "Ouvrir le fil parent dans cette discussion",
   "63e8c7a0ef0513b5": "Fils liés",
-  "68060b380fe53942": "S’exécute sur {label}. Connectez-vous-y pour y ouvrir le fil.",
   "9996d9dac573001a": "Ouvrir sur {label}",
   "15a601a94893277f": "Impossible d’ouvrir le fil parent",
   "5eb43f554a5b7a58": "Le fil parent a été supprimé",
@@ -12196,5 +12195,8 @@
   "27d76249d09eb69f": "Guide de revue prêt",
   "faa3bb26abb39c93": "Échec du guide de revue",
   "b7df38b7d8792d78": "Ouvrir le guide",
-  "9e91e9a77b664e4e": "Impossible de démarrer un guide de revue"
+  "9e91e9a77b664e4e": "Impossible de démarrer un guide de revue",
+  "f38f3c17a01c7093": "Environnement lié",
+  "8133f1bc777e09d9": "Ouverture de la conversation…",
+  "a68d753aed6a7895": "Impossible d’ouvrir la conversation"
 }

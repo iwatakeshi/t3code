@@ -1,3 +1,5 @@
+import * as PubSub from "effect/PubSub";
+import * as Stream from "effect/Stream";
 import {
   AuthMcpClientAccess,
   AuthMcpRegistrationError,
@@ -95,6 +97,10 @@ export class PeerLinks extends Context.Service<
   {
     /** Whether the Linked environments beta (Settings → Labs) is on here. */
     readonly enabled: Effect.Effect<boolean>;
+    readonly awaitInvalidation: (
+      environmentId: EnvironmentId,
+      linkedAt: DateTime.Utc,
+    ) => Effect.Effect<void, PeerLinkError>;
     readonly link: (input: PeerLinkCreateInput) => Effect.Effect<PeerLink, PeerLinkError>;
     /**
      * Links like `link`, except that a machine whose link has not expired is
@@ -241,6 +247,7 @@ const make = Effect.gen(function* () {
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const isOwnLoopback = yield* LoopbackHost;
+  const changes = yield* PubSub.unbounded<EnvironmentId>();
   const enabled = serverSettings.getSettings.pipe(
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
@@ -596,6 +603,7 @@ const make = Effect.gen(function* () {
     if (Option.isSome(previous) && previous.value.secret_name !== secretName) {
       yield* secrets.remove(previous.value.secret_name).pipe(Effect.ignore);
     }
+    yield* PubSub.publish(changes, linked.environmentId);
     return { link: linked, alreadyLinked: false };
   });
 
@@ -662,6 +670,7 @@ const make = Effect.gen(function* () {
       for (const row of deleted) {
         yield* secrets.remove(row.secret_name).pipe(Effect.catch(failStorage));
       }
+      if (deleted.length > 0) yield* PubSub.publish(changes, environmentId);
       return deleted.length > 0;
     },
   );
@@ -751,7 +760,39 @@ const make = Effect.gen(function* () {
       WHERE environment_id = ${environmentId} AND expires_at < ${DateTime.formatIso(expiresAt)}
     `.pipe(Effect.asVoid, Effect.ignoreCause({ log: true }));
 
+  const awaitInvalidation = Effect.fn("PeerLinks.awaitInvalidation")(function* (
+    environmentId: EnvironmentId,
+    linkedAt: DateTime.Utc,
+  ) {
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        const subscription = yield* PubSub.subscribe(changes);
+        const settings = yield* serverSettings.subscribeChanges;
+        const current = yield* get(environmentId);
+        if (
+          Option.isNone(current) ||
+          !DateTime.Equivalence(current.value.linkedAt, linkedAt) ||
+          !(yield* enabled)
+        )
+          return;
+        yield* Effect.raceFirst(
+          Stream.fromSubscription(subscription).pipe(
+            Stream.filter((id) => id === environmentId),
+            Stream.take(1),
+            Stream.runDrain,
+          ),
+          settings.pipe(
+            Stream.filter((value) => !value.linkedEnvironmentsEnabled),
+            Stream.take(1),
+            Stream.runDrain,
+          ),
+        );
+      }),
+    );
+  });
+
   return PeerLinks.of({
+    awaitInvalidation,
     enabled,
     link,
     linkUnlessLinked,

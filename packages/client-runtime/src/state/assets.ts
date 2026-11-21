@@ -1,3 +1,4 @@
+import { environmentBasePath } from "../environment/endpoint.ts";
 import {
   type AssetCreateUrlInput,
   type AssetCreateUrlResult,
@@ -59,7 +60,11 @@ function parseAssetCollectionKey(
 
 export function resolveAssetUrl(httpBaseUrl: string, relativeUrl: string): string | null {
   try {
-    return new URL(relativeUrl, httpBaseUrl).toString();
+    const url = new URL(relativeUrl, httpBaseUrl);
+    if (relativeUrl.startsWith("/") && !relativeUrl.startsWith("//")) {
+      url.pathname = `${environmentBasePath(httpBaseUrl)}${url.pathname}`;
+    }
+    return url.toString();
   } catch {
     return null;
   }

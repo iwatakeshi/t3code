@@ -1,3 +1,5 @@
+import * as PeerConversations from "./peer/PeerConversations.ts";
+import * as PeerConversationHttp from "./peer/PeerConversationHttp.ts";
 import * as OrchestratorMcpService from "./mcp/OrchestratorMcpService.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
@@ -868,6 +870,7 @@ const layerMakeRoutes = Layer.mergeAll(
     PreviewTunnel.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
     Ws.layer,
+    PeerConversationHttp.layer,
     speechStreamRouteLayer,
   ),
   McpHttpServer.layer.pipe(
@@ -909,7 +912,7 @@ const layerMakeRoutes = Layer.mergeAll(
   Layer.provide(PreviewBrowser.layer),
   // Links to other environments, shared by Settings (WebSocket) and agents (/mcp).
   Layer.provide(
-    PeerForwarding.layer.pipe(
+    Layer.merge(PeerForwarding.layer, PeerConversations.layer).pipe(
       Layer.provideMerge(PeerMcpClient.layer),
       Layer.provideMerge(PeerLinks.layer),
     ),

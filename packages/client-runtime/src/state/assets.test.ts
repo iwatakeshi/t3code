@@ -28,10 +28,27 @@ import { resolveMediaSource } from "../mediaSource.ts";
 import type * as RpcSession from "../rpc/session.ts";
 import {
   ASSET_URL_MAX_IN_FLIGHT,
+  resolveAssetUrl,
   createAssetEnvironmentAtoms,
   createProjectFaviconUrlAtomFamily,
   makeRevisionedAssetUrlFamily,
 } from "./assets.ts";
+
+it.each([
+  [
+    "/api/assets/signed/image.png",
+    "https://coordinator.test/api/peer-conversations/route/api/assets/signed/image.png",
+  ],
+  [
+    "/api/attachments/upload/signed?retry=1",
+    "https://coordinator.test/api/peer-conversations/route/api/attachments/upload/signed?retry=1",
+  ],
+  ["https://media.test/image.png", "https://media.test/image.png"],
+])("keeps signed resources on their linked conversation route: %s", (relative, expected) => {
+  expect(resolveAssetUrl("https://coordinator.test/api/peer-conversations/route", relative)).toBe(
+    expected,
+  );
+});
 
 describe("project favicon URL cache", () => {
   it("does not reuse another environment, workspace, or selected icon's cached URL", () => {

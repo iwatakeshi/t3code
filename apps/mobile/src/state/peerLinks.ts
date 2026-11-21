@@ -1,3 +1,6 @@
+import { useNavigation } from "@react-navigation/native";
+import { msg, useMessages } from "gt-react-native";
+import * as Dialog from "../components/ui/Dialog";
 import { useAtomValue } from "@effect/atom-react";
 import {
   linkableMachines,
@@ -5,13 +8,13 @@ import {
   offersLinkedEnvironments,
 } from "@t3tools/client-runtime/link-request";
 import { createPeerLinkEnvironmentAtoms } from "@t3tools/client-runtime/state/peerLinks";
-import type { EnvironmentId } from "@t3tools/contracts";
-import { useEffect, useEffectEvent, useMemo } from "react";
+import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { useEffect, useEffectEvent, useMemo, useState } from "react";
 
 import { connectionAtomRuntime } from "../connection/runtime";
 import { useEnvironments } from "./environments";
 import { relayEnvironmentDiscovery } from "./relay";
-import { useEnvironmentQuery } from "./query";
+import { formatEnvironmentQueryError, useEnvironmentQuery } from "./query";
 import { useAtomCommand } from "./use-atom-command";
 
 export const peerLinkEnvironment = createPeerLinkEnvironmentAtoms(connectionAtomRuntime);
@@ -68,4 +71,38 @@ export function useLinkableMachines(environmentId: EnvironmentId, enabled: boole
     links: links.data?.links ?? [],
     connect: discovery.environments,
   });
+}
+
+export function useOpenLinkedConversation(coordinatorId: EnvironmentId) {
+  const command = useAtomCommand(peerLinkEnvironment.openConversation, { reportFailure: false });
+  const { presentationById } = useEnvironments();
+  const [opening, setOpening] = useState(false);
+  const navigation = useNavigation();
+  const messages = useMessages();
+  const openConversation = async (target: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+  }) => {
+    const environment = presentationById.get(target.environmentId);
+    if (
+      environment !== undefined &&
+      (environment.entry.target._tag !== "LinkedConnectionTarget" ||
+        environment.connection.phase === "connected")
+    )
+      return true;
+    const location = navigation.getState();
+    setOpening(true);
+    const result = await command({ environmentId: coordinatorId, input: target });
+    setOpening(false);
+    if (navigation.getState() !== location) return false;
+    if (result._tag === "Failure") {
+      Dialog.alert(
+        messages(msg("Could not open conversation")),
+        formatEnvironmentQueryError(result.cause, messages),
+      );
+      return false;
+    }
+    return true;
+  };
+  return { openConversation, opening };
 }
