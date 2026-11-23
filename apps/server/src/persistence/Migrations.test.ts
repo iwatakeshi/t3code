@@ -29,6 +29,45 @@ const v2TableCount = Effect.gen(function* () {
 });
 
 describe("runMigrations", () => {
+  it.effect.each([true, false])(
+    "recognizes only the exact official 0.1.11 ledger (matches=%s)",
+    (matches) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations();
+        yield* sql`INSERT INTO orchestration_v2_projection_thread_item_counts VALUES ('kept-thread', 3)`;
+        yield* sql`DROP TABLE delegated_task_placements`;
+        for (const name of [
+          "orchestration_v2_projection_runs_delegated_capacity_idx",
+          "orchestration_v2_projection_subagents_delegated_capacity_idx",
+          "orchestration_v2_effect_outbox_delegated_capacity_idx",
+          "orchestration_v2_projection_subagents_queued_placement_idx",
+        ])
+          yield* sql.unsafe(`DROP INDEX ${name}`);
+        yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id BETWEEN 99 AND 103`;
+        yield* sql`UPDATE effect_sql_migrations SET migration_id = migration_id - 5 WHERE migration_id BETWEEN 104 AND 107`;
+
+        if (!matches) {
+          yield* sql`UPDATE effect_sql_migrations SET name = 'UnknownMigration' WHERE migration_id = 102`;
+          const before = yield* history;
+          assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+          assert.deepStrictEqual(yield* history, before);
+          return;
+        }
+        yield* runMigrations();
+        assert.deepStrictEqual(yield* history, migrationManifest);
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM orchestration_v2_projection_thread_item_counts`,
+          [{ thread_id: "kept-thread", item_count: 3 }],
+        );
+        yield* sql`INSERT INTO delegated_task_placements
+        (request_namespace, parent_thread_id, client_request_id, target_json, requirements_json, isolation, base_commit)
+        VALUES ('ns', 'parent', 'request', '{}', '{}', 'worktree', 'commit')`;
+        yield* sql`PRAGMA query_only = ON`;
+        assert.deepStrictEqual(yield* runMigrations(), []);
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
   it.effect("refuses to start when another migration took a V2 id", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

@@ -285,6 +285,53 @@ const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function*
 
 const latestMigrationId = Math.max(...migrationEntries.map(([id]) => id));
 
+// Official 0.1.11 used 99–102 for the migrations this fork keeps at 104–107.
+const reconcileOfficialMigrationHistory = Effect.fn("reconcileOfficialMigrationHistory")(
+  function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const tables = yield* sql`SELECT name FROM sqlite_master WHERE name = 'effect_sql_migrations'`;
+    if (tables.length === 0) return [];
+    const rows = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+      SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
+    `;
+    const official = rows.filter((row) => row.migration_id >= 99);
+    const relocated = migrationEntries.filter(([id]) => id >= 104 && id <= 107);
+    if (
+      official.length !== relocated.length ||
+      !relocated.every(
+        ([id, name], index) =>
+          official[index]?.migration_id === id - 5 && official[index]?.name === name,
+      ) ||
+      skippedV2Migrations(
+        rows
+          .filter((row) => row.migration_id < 99)
+          .map((row) => ({ id: row.migration_id, name: row.name })),
+        98,
+      ).length > 0
+    )
+      return [];
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`UPDATE effect_sql_migrations SET migration_id = migration_id + 5 WHERE migration_id BETWEEN 99 AND 102`;
+        const added: Array<readonly [number, string]> = [];
+        for (const [id, name, migration] of migrationEntries.filter(
+          (entry) =>
+            entry[0] === 99 ||
+            entry[0] === 100 ||
+            entry[0] === 101 ||
+            entry[0] === 102 ||
+            entry[0] === 103,
+        )) {
+          yield* migration;
+          yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (${id}, ${name})`;
+          added.push([id, name]);
+        }
+        return added;
+      }),
+    );
+  },
+);
+
 // Mirrors the Migrator, which runs only ids above the highest recorded, plus the V2-preview reconciliation.
 export const hasPendingMigrations = Effect.fn("hasPendingMigrations")(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -318,6 +365,10 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
   // The reconcile takes the write lock; CLI startup must not contend with the server for a no-op.
   const previewMigrations = includesV2 && hasPending ? yield* reconcileV2PreviewMigration() : [];
+  const officialMigrations =
+    hasPending && (toMigrationInclusive === undefined || toMigrationInclusive >= 107)
+      ? yield* reconcileOfficialMigrationHistory()
+      : [];
   if (includesV2) {
     yield* assertV2MigrationsCanRun(toMigrationInclusive);
   }
@@ -338,7 +389,10 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
   );
   // One transaction per migration: an index build on a large database can take minutes, and a
   // restart then resumes after the last finished migration instead of rolling all of them back.
-  const executedMigrations: Array<readonly [id: number, name: string]> = [...previewMigrations];
+  const executedMigrations: Array<readonly [id: number, name: string]> = [
+    ...previewMigrations,
+    ...officialMigrations,
+  ];
   for (const [index, [id, name]] of pending.entries()) {
     if (latestRecordedId > 0) {
       yield* Effect.log(DATABASE_MIGRATION_PROGRESS_MESSAGE).pipe(
